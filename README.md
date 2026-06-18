@@ -1,7 +1,7 @@
 # Smart-Salt-Tunnel
 Smart Salt Tunnel Schema, Integration Code + NRF24L01 communication
 
-<img width="2562" height="2648" alt="Smart Salt Tunnel_schem" src="https://github.com/user-attachments/assets/765277c4-0fb4-4300-98a4-3d43a988efd2" />
+<img width="2646" height="2647" alt="Smart Salt Tunnel_schem" src="https://github.com/user-attachments/assets/f4926b8d-1219-4781-8c11-c86d6d41451e" />
 
 
 ```text
