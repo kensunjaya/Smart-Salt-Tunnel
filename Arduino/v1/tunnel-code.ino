@@ -1,7 +1,7 @@
 /*
 SMART SALT TUNNEL v1
 Author: Kenneth Sunjaya
-Last Updated: 6 September 2026
+Last Updated: 9 September 2026
 */
 
 #include <Wire.h>
@@ -17,7 +17,8 @@ Last Updated: 6 September 2026
 #define RELAY_PIN 5
 #define WATER_LEVEL_PIN A2
 #define WATER_TEMP_PIN A3
-
+#define DMS_S_PIN 6
+#define DMS_ANALOG_PIN A0
 
 Adafruit_HTU21DF htu = Adafruit_HTU21DF();
 OneWire oneWire(WATER_TEMP_PIN);
@@ -333,9 +334,61 @@ int16_t getPH() {
   return -100;
 }
 
+uint16_t getSalinityADC(uint8_t pin, uint8_t sample_count) {
+  uint32_t total = 0;
+  uint16_t min_value = 1023;
+  uint16_t max_value = 0;
+  // trimmed mean ADC
+  for (uint8_t i = 0; i < sample_count; i++) {
+    uint16_t value = analogRead(pin);
+    total += value;
+
+    if (value < min_value) {
+      min_value = value;
+    }
+    if (value > max_value) {
+      max_value = value;
+    }
+
+    delay(2);
+  }
+
+  total -= min_value;
+  total -= max_value;
+
+  return total / (sample_count - 2);
+}
+
 uint16_t getSalinity() {
-  // TODO
-  return 20000;
+  digitalWrite(DMS_S_PIN, LOW); // DMS ON (active LOW)
+
+  delay(100);
+
+  // Buang ADC reading pertama
+  analogRead(DMS_ANALOG_PIN);
+
+  uint16_t adc_value = getSalinityADC(DMS_ANALOG_PIN, 20);
+
+  digitalWrite(DMS_S_PIN, HIGH); // DMS OFF
+
+  // ADC -> konduktivitas (uS/cm)
+  // ini masih pakai kalibrasi bawaan dari penjual
+  float conductivity = (0.2142f * adc_value) + 494.93f;
+
+  // konduktivitas -> salinitas (ppt)
+  float salinity = conductivity * 0.00064f;
+
+  Serial.print(F("Salinity ADC="));
+  Serial.print(adc_value);
+
+  Serial.print(F(" conductivity="));
+  Serial.print(conductivity, 2);
+
+  Serial.print(F(" uS/cm salinity="));
+  Serial.print(salinity, 2);
+  Serial.println(F(" ppt"));
+
+  return (uint16_t)(salinity * 100.0f + 0.5f);
 }
 
 uint16_t getWaterLevel() {
@@ -347,14 +400,13 @@ uint16_t getWaterLevel() {
   uint16_t max_value = 0;
 
   for (uint8_t i = 0; i < sample_count; i++) {
-    uint16_t value = analogRead(A2);
+    uint16_t value = analogRead(WATER_LEVEL_PIN);
 
     total += value;
     
     if (value < min_value) {
       min_value = value;
     }
-
     if (value > max_value) {
       max_value = value;
     }
@@ -442,17 +494,24 @@ void handleTelemetry() {
 
 void setup() {
   Serial.begin(115200);
+
   pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, HIGH);
-  
+  digitalWrite(RELAY_PIN, HIGH); // Relay OFF
+
+  pinMode(DMS_S_PIN, OUTPUT);
+  digitalWrite(DMS_S_PIN, HIGH); // DMS OFF
+
   delay(2000);
-  
+
   if (!htu.begin()) {
     Serial.println(F("Air Temp & Humidity Sensor not detected"));
-    while (true);
   }
 
   waterTempSensor.begin();
+
+  if (waterTempSensor.getDeviceCount() == 0) {
+    Serial.println(F("Water Temperature Sensor not detected"));
+  }
 
   Serial.println();
   Serial.println(F("===================="));
