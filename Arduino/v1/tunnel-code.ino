@@ -36,6 +36,7 @@ const uint8_t MSG_REGISTER_ACK = 2;
 const uint8_t MSG_TELEMETRY = 3;
 const uint8_t MSG_START_TRANSFER = 4;
 const uint8_t MSG_TRANSFER_COMPLETE = 5;
+const uint8_t MSG_SET_STATUS = 6;
 
 
 // REGISTRATION STATUS
@@ -56,19 +57,23 @@ DeviceState device_state = REGISTERING;
 
 
 // TIMING CONFIG
-
 const unsigned long REGISTER_RETRY_INTERVAL = 20000; // interval retry kirim register request jika gagal.
 const unsigned long TELEMETRY_INTERVAL = 10000; // interval tunnel kirim telemetry
+const unsigned long TELEMETRY_JITTER = 1000; // range untuk jitter interval yang diperbolehkan, untuk menghindari beberapa tunnel kirim telemetry secara bersamaan
 
+unsigned long current_telemetry_interval = TELEMETRY_INTERVAL;
 unsigned long last_register_attempt = 0;
 unsigned long last_telemetry_timestamp = 0;
 
 
 // MESSAGE STATE
-
 uint32_t telemetry_sequence = 0;
-uint32_t prev_message_id = 0;
+uint32_t active_message_id = 0;
+uint32_t last_completed_message_id = 0;
 uint16_t active_min_level = 0;
+bool transfer_active = false;
+unsigned long last_transfer_check = 0;
+const unsigned long TRANSFER_CHECK_INTERVAL = 500;
 
 
 // HELPER FUNCTIONS
@@ -143,7 +148,7 @@ void sendRegisterRequest() {
 
   radio.startListening();
 
-  Serial.print(F("REGISTER_REQUEST -> RPi"));
+  Serial.print(F("(TX) REGISTER_REQUEST -> RPi"));
 
   if (success) {
     Serial.println(F(" [ACK]"));
@@ -158,11 +163,14 @@ void sendRegisterRequest() {
 void handleRegisterAck(byte* packet) {
   uint8_t status = packet[6];
 
-  Serial.print(F("REGISTER_ACK <- Pi"));
+  Serial.print(F("(RX) REGISTER_ACK <- Pi"));
 
   if (status == STATUS_ENABLED) {
     device_state = ENABLED;
     last_telemetry_timestamp = millis();
+  
+    generateNextTelemetryInterval();
+  
     Serial.println(F("STATUS: ENABLED"));
   }
 
@@ -177,6 +185,33 @@ void handleRegisterAck(byte* packet) {
   }
 }
 
+void handleSetStatus(byte* packet) {
+  uint8_t status = packet[6];
+
+  if (status == STATUS_DISABLED) {
+    device_state = DISABLED;
+
+    digitalWrite(RELAY_PIN, HIGH); // jika status disabled dikirimkan, maka langsung paksa matikan pompa
+
+    if (transfer_active) {
+      transfer_active = false;
+      active_message_id = 0;
+
+      Serial.println(F("Active transfer cancelled"));
+    }
+
+    Serial.println(F("(RX) DEVICE DISABLED"));
+    Serial.println(F("(-) PUMP: OFF"));
+    return;
+  }
+
+  if (status == STATUS_ENABLED) {
+    device_state = ENABLED;
+
+    Serial.println(F("(RX) DEVICE ENABLED"));
+  }
+}
+
 
 // START TRANSFER
 
@@ -185,68 +220,94 @@ void handleStartTransfer(byte* packet) {
     return;
   }
 
-  Serial.print(F("RAW packet[10]="));
-  Serial.print(packet[10], HEX);
-
-  Serial.print(F(" packet[11]="));
-  Serial.println(packet[11], HEX);
-
   uint32_t message_id = readUInt32LE(packet, 6);
   uint16_t min_level = readUInt16LE(packet, 10);
 
-  Serial.print(F("Decoded min_level="));
+  Serial.println();
+  Serial.println(F("(RX) START_TRASNFER"));
+
+  Serial.print(F("message_id="));
+  Serial.println(message_id);
+
+  Serial.print(F("min_level="));
   Serial.println(min_level);
 
-  if (message_id == prev_message_id) {
-    sendTransferComplete();
+  // jika masih ada transfer yang sedang berjalan
+  if (transfer_active) {
+    if (message_id == active_message_id) {
+      Serial.println(F("Transfer already active"));
+    } else {
+      Serial.println(F("Another transfer is already active, ignoring"));
+    }
+
     return;
   }
 
-  prev_message_id = message_id;
+  // transfer ini udah selesai sebelumnya
+  if (message_id == last_completed_message_id) {
+    Serial.println(F("Transfer already completed, resending TRANSFER_COMPLETE"));
+    sendTransferComplete(last_completed_message_id);
+    return;
+  }
+
+  // mulai transfer air
+  active_message_id = message_id;
   active_min_level = min_level;
+  transfer_active = true;
+
+  last_transfer_check = 0;
 
   digitalWrite(RELAY_PIN, LOW);
 
-  Serial.println();
-  Serial.println(F("*** START_TRANSFER RECEIVED ***"));
-
-  Serial.print(F("message_id="));
-  Serial.println(prev_message_id);
-
-  Serial.print(F("min_level="));
-  Serial.println(active_min_level);
-
   Serial.println(F("(+) PUMP: ON"));
-
-  uint16_t temp_water_level = getWaterLevel();
-
-  // TRANSFERRING
-  // TODO: ubah menjadi non-blocking process
-  while (temp_water_level > active_min_level) {
-    Serial.print(F("Water level: "));
-    Serial.println(temp_water_level);
-    delay(500);
-    temp_water_level = getWaterLevel();
-  }
-
-  // TRANSFER DONE
-  digitalWrite(RELAY_PIN, HIGH);
-  Serial.println(F("(-) PUMP: OFF"));
-  
-  sendTransferComplete();
 }
 
+void handleTransfer() {
+  if (!transfer_active) {
+    return;
+  }
+
+  unsigned long now = millis();
+
+  if (last_transfer_check != 0 &&
+      now - last_transfer_check < TRANSFER_CHECK_INTERVAL) {
+    return;
+  }
+
+  last_transfer_check = now;
+
+  uint16_t water_level = getWaterLevel();
+
+  Serial.print(F("Transfer water_level="));
+  Serial.print(water_level);
+
+  Serial.print(F(" min_level="));
+  Serial.println(active_min_level);
+
+  if (water_level <= active_min_level) {
+    digitalWrite(RELAY_PIN, HIGH);
+
+    Serial.println(F("(-) PUMP: OFF"));
+    Serial.println(F("*** MINIMUM WATER LEVEL REACHED ***"));
+
+    uint32_t completed_message_id = active_message_id;
+
+    transfer_active = false;
+    active_message_id = 0;
+
+    last_completed_message_id = completed_message_id;
+
+    sendTransferComplete(completed_message_id);
+  }
+}
 
 // TRANSFER COMPLETE
-
-void sendTransferComplete() {
-  delay(500);
-  Serial.println(F("++ Building Transfer Complete Payload..."));
+void sendTransferComplete(uint32_t message_id) {
   byte packet[PAYLOAD_SIZE] = {0};
 
   packet[0] = MSG_TRANSFER_COMPLETE;
   memcpy(&packet[1], DEVICE_ADDRESS, 5);
-  writeUInt32LE(packet, 6, prev_message_id);
+  writeUInt32LE(packet, 6, message_id);
 
   Serial.println(F("++ Sending Transfer Complete via Radio..."));
 
@@ -257,7 +318,7 @@ void sendTransferComplete() {
   radio.startListening();
 
   Serial.print(F("TRANSFER_COMPLETE -> RPi, message_id="));
-  Serial.print(prev_message_id);
+  Serial.print(message_id);
 
   if (success) {
     Serial.println(F(" [ACK]"));
@@ -266,6 +327,7 @@ void sendTransferComplete() {
   }
 }
 
+// CEK BUFFER FIFO RX
 void checkIncomingRadio() {
   if (!radio.available()) {
     return;
@@ -297,13 +359,16 @@ void checkIncomingRadio() {
   else if (message_type == MSG_START_TRANSFER) {
     handleStartTransfer(packet);
   }
+
+  else if (message_type == MSG_SET_STATUS) {
+    handleSetStatus(packet);
+  }
 }
 
 
 // REGISTRATION
-
 void handleRegistration() {
-  if (device_state == ENABLED) {
+  if (device_state != REGISTERING && device_state != UNREGISTERED) {
     return;
   }
 
@@ -315,6 +380,7 @@ void handleRegistration() {
   }
 }
 
+// SENSOR READINGS
 int16_t getWaterTemp() {
   waterTempSensor.requestTemperatures();
   float temperature = waterTempSensor.getTempCByIndex(0);
@@ -331,7 +397,7 @@ uint16_t getHumidity() {
 
 int16_t getPH() {
   // TODO
-  return -100;
+  return -1;
 }
 
 uint16_t getSalinityADC(uint8_t pin, uint8_t sample_count) {
@@ -362,9 +428,9 @@ uint16_t getSalinityADC(uint8_t pin, uint8_t sample_count) {
 uint16_t getSalinity() {
   digitalWrite(DMS_S_PIN, LOW); // DMS ON (active LOW)
 
-  delay(100);
+  delay(100); // tunggu sebentar sampai sensor stabil
 
-  // Buang ADC reading pertama
+  // buang ADC reading pertama
   analogRead(DMS_ANALOG_PIN);
 
   uint16_t adc_value = getSalinityADC(DMS_ANALOG_PIN, 20);
@@ -477,23 +543,32 @@ void sendTelemetry() {
 }
 
 
-// TELEMETRY
 
+// menambahkan offset jitter pada telemetry interval secara acak
+void generateNextTelemetryInterval() {
+  long jitter = random(-(long)TELEMETRY_JITTER, (long)TELEMETRY_JITTER + 1);
+  current_telemetry_interval = TELEMETRY_INTERVAL + jitter;
+}
+
+// TELEMETRY (menentukan akan kirim telemetry atau tidak)
 void handleTelemetry() {
-  if (device_state != ENABLED) {
+  if (device_state != ENABLED || transfer_active) {
     return;
   }
 
   unsigned long now = millis();
 
-  if (now - last_telemetry_timestamp >= TELEMETRY_INTERVAL) {
+  if (now - last_telemetry_timestamp >= current_telemetry_interval) {
     last_telemetry_timestamp = now;
     sendTelemetry();
+    generateNextTelemetryInterval();
   }
 }
 
 void setup() {
   Serial.begin(115200);
+
+  randomSeed(analogRead(A1)); // random seed noise untuk jitter interval
 
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, HIGH); // Relay OFF
@@ -514,9 +589,9 @@ void setup() {
   }
 
   Serial.println();
-  Serial.println(F("===================="));
+  Serial.println(F("--------------------"));
   Serial.println(F("SMART SALT TUNNEL v1"));
-  Serial.println(F("===================="));
+  Serial.println(F("--------------------"));
 
   initializeRadio();
 
@@ -527,4 +602,5 @@ void loop() {
   checkIncomingRadio();
   handleRegistration();
   handleTelemetry();
+  handleTransfer();
 }
