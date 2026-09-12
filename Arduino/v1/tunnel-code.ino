@@ -1,9 +1,10 @@
 /*
 SMART SALT TUNNEL v1
 Author: Kenneth Sunjaya
-Last Updated: 9 September 2026
+Last Updated: 12 September 2026
 */
 
+#include <EEPROM.h>
 #include <Wire.h>
 #include <SPI.h>
 #include <RF24.h>
@@ -26,7 +27,7 @@ DallasTemperature waterTempSensor(&oneWire);
 RF24 radio(CE_PIN, CSN_PIN);
 
 const byte RASPI_ADDRESS[6] = "RASPI"; // harus sama juga di sisi RPi
-const byte DEVICE_ADDRESS[6] = "A0001"; // unique id setiap tunnel, nanti akan dipindahkan ke EEPROM
+byte DEVICE_ADDRESS[6]; // unique identifier untuk setiap tunnel
 
 const uint8_t PAYLOAD_SIZE = 32;
 
@@ -75,6 +76,23 @@ bool transfer_active = false;
 unsigned long last_transfer_check = 0;
 const unsigned long TRANSFER_CHECK_INTERVAL = 500;
 
+bool is_htu_available = true;
+bool is_water_temp_available = true;
+
+// baca tunnel id dari EEPROM
+bool loadDeviceAddress() {
+  for (uint8_t i = 0; i < 5; i++) {
+    DEVICE_ADDRESS[i] = EEPROM.read(i);
+
+    if (DEVICE_ADDRESS[i] == 0xFF) {
+      return false;
+    }
+  }
+
+  DEVICE_ADDRESS[5] = '\0';
+
+  return true;
+}
 
 // HELPER FUNCTIONS
 
@@ -123,8 +141,8 @@ void initializeRadio() {
   radio.setDataRate(RF24_250KBPS);
   radio.setPALevel(RF24_PA_LOW);
   radio.setPayloadSize(PAYLOAD_SIZE);
-  radio.setAutoAck(true);
-  radio.setRetries(5, 15);
+  radio.setAutoAck(true); // enhanced shockburst autoack (ESB)
+  radio.setRetries(5, 15); // retry delay, banyaknya retry yg diperbolehkan
 
   radio.openReadingPipe(1, DEVICE_ADDRESS);
   radio.openWritingPipe(RASPI_ADDRESS);
@@ -207,7 +225,10 @@ void handleSetStatus(byte* packet) {
 
   if (status == STATUS_ENABLED) {
     device_state = ENABLED;
-
+  
+    last_telemetry_timestamp = millis(); // reset last telemetry timetamp agar menghindari telemetry langsung terkirim jika memang sudah jatuh tempo
+    generateNextTelemetryInterval();
+  
     Serial.println(F("(RX) DEVICE ENABLED"));
   }
 }
@@ -382,17 +403,26 @@ void handleRegistration() {
 
 // SENSOR READINGS
 int16_t getWaterTemp() {
+  if (!is_water_temp_available) {
+    return -1;
+  }
   waterTempSensor.requestTemperatures();
   float temperature = waterTempSensor.getTempCByIndex(0);
   return (int16_t)(temperature * 100);
 }
 
 int16_t getAirTemp() {
+  if (!is_htu_available) {
+    return -1;
+  }
   return (int16_t)(htu.readTemperature() * 100);
 }
 
-uint16_t getHumidity() {
-  return (uint16_t)(htu.readHumidity() * 100);
+int16_t getHumidity() {
+  if (!is_htu_available) {
+    return -1;
+  }
+  return (int16_t)(htu.readHumidity() * 100);
 }
 
 int16_t getPH() {
@@ -495,7 +525,7 @@ void sendTelemetry() {
   
   int16_t water_temp = getWaterTemp();
   int16_t air_temp = getAirTemp();
-  uint16_t humidity = getHumidity();
+  int16_t humidity = getHumidity();
   int16_t ph = getPH();
   uint16_t salinity = getSalinity();
   uint16_t water_level = getWaterLevel();
@@ -507,7 +537,7 @@ void sendTelemetry() {
   writeUInt32LE(packet, 6, telemetry_sequence);
   writeInt16LE(packet, 10, water_temp);
   writeInt16LE(packet, 12, air_temp);
-  writeUInt16LE(packet, 14, humidity);
+  writeInt16LE(packet, 14, humidity);
   writeUInt16LE(packet, 16, water_level);
   writeUInt16LE(packet, 18, salinity);
   writeInt16LE(packet, 20, ph);
@@ -568,6 +598,14 @@ void handleTelemetry() {
 void setup() {
   Serial.begin(115200);
 
+  if (!loadDeviceAddress()) {
+    Serial.println(F("ERROR: Device ID not configured"));
+    while (true);
+  }
+
+  Serial.print(F("[LOADED] Device ID: "));
+  Serial.println((char*)DEVICE_ADDRESS);
+
   randomSeed(analogRead(A1)); // random seed noise untuk jitter interval
 
   pinMode(RELAY_PIN, OUTPUT);
@@ -578,20 +616,20 @@ void setup() {
 
   delay(2000);
 
-  if (!htu.begin()) {
+  is_htu_available = htu.begin();
+
+  if (!is_htu_available) {
     Serial.println(F("Air Temp & Humidity Sensor not detected"));
   }
 
   waterTempSensor.begin();
+  // waktu pembacaan waterTempSensor adalah ~750ms karena 12bit. bisa dikurangi menjadi ~188ms jika diset ke 10bit tapi presisinya berkurang
+  // waterTempSensor.setResolution(10);
+  is_water_temp_available = waterTempSensor.getDeviceCount() > 0;
 
-  if (waterTempSensor.getDeviceCount() == 0) {
+  if (!is_water_temp_available) {
     Serial.println(F("Water Temperature Sensor not detected"));
   }
-
-  Serial.println();
-  Serial.println(F("--------------------"));
-  Serial.println(F("SMART SALT TUNNEL v1"));
-  Serial.println(F("--------------------"));
 
   initializeRadio();
 
