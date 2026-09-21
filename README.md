@@ -1,7 +1,7 @@
 # Smart-Salt-Tunnel
 Smart Salt Tunnel Schema, Integration Code + NRF24L01 communication
 
-<img width="2646" height="2647" alt="Smart Salt Tunnel_schem" src="https://github.com/user-attachments/assets/f4926b8d-1219-4781-8c11-c86d6d41451e" />
+<img width="3248" height="2299" alt="Schematic_Smart-Salt-Tunnel-std-v1_2026-09-18-2-1" src="https://github.com/user-attachments/assets/f900956e-dba4-4007-935e-134dbdd30bd3" />
 
 
 ```text
@@ -39,7 +39,7 @@ DATA        -> D2
 ```text
 HTU21D      Arduino
 --------------------
-+       -> 5V
++       -> 3.3V
 -       -> GND
 DA      -> A4
 CL      -> A5
