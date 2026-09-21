@@ -1,7 +1,7 @@
 /*
 SMART SALT TUNNEL v1
 Author: Kenneth Sunjaya
-Last Updated: 12 September 2026
+Last Updated: 22 September 2026
 */
 
 #include <EEPROM.h>
@@ -284,6 +284,7 @@ void handleStartTransfer(byte* packet) {
 }
 
 void handleTransfer() {
+  // Serial.println(F("Handling Transfer..."));
   if (!transfer_active) {
     return;
   }
@@ -307,18 +308,25 @@ void handleTransfer() {
 
   if (water_level <= active_min_level) {
     digitalWrite(RELAY_PIN, HIGH);
-
+  
     Serial.println(F("(-) PUMP: OFF"));
     Serial.println(F("*** MINIMUM WATER LEVEL REACHED ***"));
-
+  
     uint32_t completed_message_id = active_message_id;
-
+  
     transfer_active = false;
     active_message_id = 0;
-
+  
     last_completed_message_id = completed_message_id;
-
+  
+    // jangan langsung kirim telemetry setelah transfer selesai
+    last_telemetry_timestamp = millis();
+    generateNextTelemetryInterval();
+  
     sendTransferComplete(completed_message_id);
+  
+    Serial.print(F("TRANSFER IS COMPLETED: "));
+    Serial.println(transfer_active);
   }
 }
 
@@ -350,6 +358,7 @@ void sendTransferComplete(uint32_t message_id) {
 
 // CEK BUFFER FIFO RX
 void checkIncomingRadio() {
+  // Serial.println(F("Checking for incoming radio..."));
   if (!radio.available()) {
     return;
   }
@@ -358,18 +367,37 @@ void checkIncomingRadio() {
 
   radio.read(packet, PAYLOAD_SIZE);
 
-  // DEBUG NOISE YANG MUNCUL
+  // DEBUG RAW PACKET
   Serial.print(F("RX RAW: "));
 
   for (uint8_t i = 0; i < 12; i++) {
     if (packet[i] < 0x10) {
       Serial.print('0');
     }
+
     Serial.print(packet[i], HEX);
     Serial.print(' ');
   }
-  
+
   Serial.println();
+
+
+  // CEK APAKAH PACKET ISINYA SEMUA 0x00
+  bool all_zero = true;
+
+  for (uint8_t i = 0; i < PAYLOAD_SIZE; i++) {
+    if (packet[i] != 0) {
+      all_zero = false;
+      break;
+    }
+  }
+  // jika packet isinya 0 semua, buang paket
+  if (all_zero) {
+    Serial.println(F("WARNING: ZERO PACKET DETECTED"));
+    radio.flush_rx();
+    return;
+  }
+
 
   uint8_t message_type = packet[0];
 
@@ -384,11 +412,15 @@ void checkIncomingRadio() {
   else if (message_type == MSG_SET_STATUS) {
     handleSetStatus(packet);
   }
+
+  else {
+    Serial.print(F("WARNING: UNKNOWN MESSAGE TYPE: "));
+    Serial.println(message_type);
+  }
 }
-
-
 // REGISTRATION
 void handleRegistration() {
+  // Serial.println(F("Handling Registration..."));
   if (device_state != REGISTERING && device_state != UNREGISTERED) {
     return;
   }
@@ -415,14 +447,30 @@ int16_t getAirTemp() {
   if (!is_htu_available) {
     return -1;
   }
-  return (int16_t)(htu.readTemperature() * 100);
+
+  float temperature = htu.readTemperature();
+
+  if (isnan(temperature)) {
+    Serial.println(F("WARNING: HTU21D temperature read failed"));
+    return -1;
+  }
+
+  return (int16_t)(temperature * 100);
 }
 
 int16_t getHumidity() {
   if (!is_htu_available) {
     return -1;
   }
-  return (int16_t)(htu.readHumidity() * 100);
+
+  float humidity = htu.readHumidity();
+
+  if (isnan(humidity)) {
+    Serial.println(F("WARNING: HTU21D humidity read failed"));
+    return -1;
+  }
+
+  return (int16_t)(humidity * 100);
 }
 
 int16_t getPH() {
@@ -522,12 +570,17 @@ uint16_t getWaterLevel() {
 
 void sendTelemetry() {
   byte packet[PAYLOAD_SIZE] = {0};
-  
+  Serial.println(F("Reading water temperature..."));
   int16_t water_temp = getWaterTemp();
+  Serial.println(F("Reading air temperature..."));
   int16_t air_temp = getAirTemp();
+  Serial.println(F("Reading humidity..."));
   int16_t humidity = getHumidity();
+  Serial.println(F("Reading pH..."));
   int16_t ph = getPH();
+  Serial.println(F("Reading salinity..."));
   uint16_t salinity = getSalinity();
+  Serial.println(F("Reading water level..."));
   uint16_t water_level = getWaterLevel();
 
   packet[0] = MSG_TELEMETRY;
@@ -541,6 +594,7 @@ void sendTelemetry() {
   writeUInt16LE(packet, 16, water_level);
   writeUInt16LE(packet, 18, salinity);
   writeInt16LE(packet, 20, ph);
+  Serial.println(F("Ready to send telemetry to RPi..."));
 
   radio.stopListening();
   bool success = radio.write(packet, PAYLOAD_SIZE);
@@ -572,8 +626,6 @@ void sendTelemetry() {
   telemetry_sequence++;
 }
 
-
-
 // menambahkan offset jitter pada telemetry interval secara acak
 void generateNextTelemetryInterval() {
   long jitter = random(-(long)TELEMETRY_JITTER, (long)TELEMETRY_JITTER + 1);
@@ -582,6 +634,7 @@ void generateNextTelemetryInterval() {
 
 // TELEMETRY (menentukan akan kirim telemetry atau tidak)
 void handleTelemetry() {
+  // Serial.println(F("Handling Telemetry..."));
   if (device_state != ENABLED || transfer_active) {
     return;
   }
@@ -615,6 +668,9 @@ void setup() {
   digitalWrite(DMS_S_PIN, HIGH); // DMS OFF
 
   delay(2000);
+
+  Wire.begin();
+  Wire.setWireTimeout(10000, true);
 
   is_htu_available = htu.begin();
 
