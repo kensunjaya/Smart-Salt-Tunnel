@@ -1,0 +1,59 @@
+{
+  "tunnels": [
+    {
+      "device_id": "A0001",
+      "role": "FRONT",
+      "is_enabled": true,
+      "has_ph_meter": false,
+      "thresholds": {
+        "water_level_target": 550,
+        "min_level": 500,
+        "salinity_target": 0
+      }
+    },
+    {
+      "device_id": "A0002",
+      "role": "MIDDLE",
+      "is_enabled": true,
+      "has_ph_meter": false,
+      "thresholds": {
+        "water_level_target": 600,
+        "min_level": 550,
+        "salinity_target": 0
+      }
+    },
+    {
+      "device_id": "A0003",
+      "role": "BACK",
+      "is_enabled": true,
+      "has_ph_meter": false,
+      "thresholds": {
+        "water_level_target": 550,
+        "min_level": 300,
+        "salinity_target": 200
+      }
+    },
+    {
+      "device_id": "A0004",
+      "role": "BACK",
+      "is_enabled": true,
+      "has_ph_meter": false,
+      "thresholds": {
+        "water_level_target": 550,
+        "min_level": 300,
+        "salinity_target": 200
+      }
+    },
+    {
+      "device_id": "A0005",
+      "role": "BACK",
+      "is_enabled": true,
+      "has_ph_meter": false,
+      "thresholds": {
+        "water_level_target": 550,
+        "min_level": 300,
+        "salinity_target": 200
+      }
+    }
+  ]
+}
