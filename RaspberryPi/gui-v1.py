@@ -1,298 +1,207 @@
 import json
 import queue
+import re
 import struct
 import threading
 import time
 import tkinter as tk
+from tkinter import messagebox, ttk
 
 from pyrf24 import RF24, RF24_250KBPS, RF24_PA_LOW
 
 
 latest_telemetry = {}
 tunnel_widgets = {}
+selected_device_id = None
+ROLE_OPTIONS = ("FRONT", "MIDDLE", "BACK")
 
 root = tk.Tk()
 root.title("Smart Salt Tunnel")
 root.geometry("1024x600")
 
-scroll_container = tk.Frame(root)
-scroll_container.pack(
-    fill="both",
-    expand=True,
-    padx=20,
-    pady=10
+main_frame = tk.Frame(root)
+main_frame.pack(fill="both", expand=True, padx=20, pady=10)
+
+sidebar = tk.LabelFrame(
+    main_frame,
+    text="Tunnels",
+    font=("Arial", 14, "bold"),
+    padx=8,
+    pady=8
 )
+sidebar.pack(side="left", fill="y")
 
-canvas = tk.Canvas(
-    scroll_container,
-    highlightthickness=0
+tunnel_list_frame = tk.Frame(sidebar)
+tunnel_list_frame.pack(fill="both", expand=True)
+
+add_tunnel_button = tk.Button(
+    sidebar,
+    text="+ Add tunnel",
+    font=("Arial", 12, "bold"),
+    command=lambda: open_add_tunnel_dialog()
 )
+add_tunnel_button.pack(fill="x", pady=(10, 0))
 
-scrollbar = tk.Scrollbar(
-    scroll_container,
-    orient="vertical",
-    command=canvas.yview,
-    width=35
+detail_frame = tk.LabelFrame(
+    main_frame,
+    text="Tunnel details",
+    font=("Arial", 14, "bold"),
+    padx=24,
+    pady=20
 )
+detail_frame.pack(side="left", fill="both", expand=True, padx=(15, 0))
 
-canvas.configure(
-    yscrollcommand=scrollbar.set
-)
+detail_title = tk.Label(detail_frame, text="Select a tunnel", font=("Arial", 18, "bold"))
+detail_title.pack(anchor="w", pady=(0, 15))
 
-scrollbar.pack(
-    side="right",
-    fill="y"
-)
+detail_widgets = {}
 
-canvas.pack(
-    side="left",
-    fill="both",
-    expand=True
-)
+def select_tunnel(device_id):
+    global selected_device_id
+    selected_device_id = device_id
+    tunnel = find_tunnel(device_id)
+    if tunnel is None:
+        return
 
-tunnel_frame = tk.Frame(canvas)
+    detail_title.config(text=f"{device_id} - {tunnel.get('role', '-')}")
+    for key, value in detail_widgets["info"].items():
+        value.config(text=get_tunnel_detail_value(tunnel, key))
+    update_detail_status(tunnel)
 
-tunnel_window = canvas.create_window(
-    (0, 0),
-    window=tunnel_frame,
-    anchor="nw"
-)
+def get_tunnel_detail_value(tunnel, key):
+    if key == "target_be":
+        return f'{tunnel.get("thresholds", {}).get("baume_target", 0):g} °Be'
+    return str(tunnel.get(key, "-"))
 
-def update_scroll_region(event):
-    canvas.configure(
-        scrollregion=canvas.bbox("all")
+def update_detail_status(tunnel):
+    enabled = tunnel["is_enabled"]
+    detail_widgets["edit"].config(
+        command=lambda d=tunnel["device_id"]: open_edit_tunnel_dialog(d)
+    )
+    detail_widgets["status"].config(text="ENABLED" if enabled else "DISABLED")
+    detail_widgets["toggle"].config(
+        text="DISABLE" if enabled else "ENABLE",
+        command=lambda d=tunnel["device_id"]: toggle_tunnel_status(d)
+    )
+    detail_widgets["transfer"].config(
+        text="TRANSFERRING"
+        if tunnel["device_id"] in process_map
+        else "Transfer: IDLE"
     )
 
-def resize_tunnel_frame(event):
-    canvas.itemconfigure(
-        tunnel_window,
-        width=event.width
-    )
+def create_tunnel_view():
+    for child in tunnel_list_frame.winfo_children():
+        child.destroy()
+    for child in detail_frame.winfo_children():
+        if child != detail_title:
+            child.destroy()
+    tunnel_widgets.clear()
+    detail_widgets.clear()
 
-tunnel_frame.bind(
-    "<Configure>",
-    update_scroll_region
-)
-
-canvas.bind(
-    "<Configure>",
-    resize_tunnel_frame
-)
-
-def create_tunnel_cards():
-    for index, tunnel in enumerate(TUNNELS):
+    for tunnel in TUNNELS:
         device_id = tunnel["device_id"]
-        role = tunnel["role"]
-
-        row = index // 3
-        column = index % 3
-
-        card = tk.LabelFrame(
-            tunnel_frame,
-            text=f"{device_id} - {role}",
-            font=("Arial", 16, "bold"),
-            padx=18,
-            pady=15
+        button = tk.Button(
+            tunnel_list_frame,
+            text=f'{device_id}\n{tunnel.get("role", "-")}',
+            font=("Arial", 12),
+            width=13,
+            command=lambda d=device_id: select_tunnel(d)
         )
+        button.pack(fill="x", pady=3)
 
-        card.grid(
-            row=row,
-            column=column,
-            padx=10,
-            pady=10,
-            sticky="nsew"
+    status_label = tk.Label(detail_frame, text="-", font=("Arial", 14, "bold"))
+    status_label.pack(anchor="w")
+    transfer_label = tk.Label(detail_frame, text="Transfer: IDLE", font=("Arial", 11))
+    transfer_label.pack(anchor="w", pady=(0, 15))
+
+    info_frame = tk.Frame(detail_frame)
+    info_frame.pack(fill="x")
+    info_widgets = {}
+    for key, name in [
+        ("device_id", "Device ID"),
+        ("role", "Role"),
+        ("target_be", "Target Be (Baume)")
+    ]:
+        tk.Label(info_frame, text=name, font=("Arial", 12)).grid(
+            row=len(info_widgets), column=0, sticky="w", pady=4
         )
+        value_label = tk.Label(info_frame, text="-", font=("Arial", 12, "bold"))
+        value_label.grid(row=len(info_widgets), column=1, sticky="w", padx=20, pady=4)
+        info_widgets[key] = value_label
 
-        # STATUS
-        status_label = tk.Label(
-            card,
-            text="-",
-            font=("Arial", 14, "bold")
+    sensor_frame = tk.LabelFrame(
+        detail_frame, font=("Arial", 12, "bold"), padx=12, pady=8
+    )
+    sensor_frame.pack(fill="x", pady=(20, 0))
+    sensor_labels = {}
+    for sensor_index, (key, name) in enumerate([
+        ("water_level", "Water Level"),
+        ("salinity", "Salinity"),
+        ("water_temperature", "Water Temp"),
+        ("air_temperature", "Air Temp"),
+        ("humidity", "Humidity"),
+        ("ph", "pH")
+    ]):
+        tk.Label(sensor_frame, text=name, font=("Arial", 12)).grid(
+            row=sensor_index, column=0, sticky="w", pady=3
         )
+        value_label = tk.Label(sensor_frame, text="-", font=("Arial", 12, "bold"))
+        value_label.grid(row=sensor_index, column=1, sticky="w", padx=20, pady=3)
+        sensor_labels[key] = value_label
 
-        status_label.grid(
-            row=0,
-            column=0,
-            columnspan=2,
-            sticky="w",
-            pady=(0, 3)
-        )
+    edit_button = tk.Button(
+        detail_frame,
+        text="Edit tunnel",
+        font=("Arial", 12, "bold")
+    )
+    edit_button.pack(fill="x", pady=(20, 0))
 
-        transfer_label = tk.Label(
-            card,
-            text="Transfer: IDLE",
-            font=("Arial", 11)
-        )
+    toggle_button = tk.Button(detail_frame, text="-", font=("Arial", 13, "bold"), height=2)
+    toggle_button.pack(fill="x", pady=(20, 0))
+    detail_widgets.update({
+        "status": status_label,
+        "transfer": transfer_label,
+        "edit": edit_button,
+        "toggle": toggle_button,
+        "info": info_widgets,
+        "sensors": sensor_labels
+    })
 
-        transfer_label.grid(
-            row=1,
-            column=0,
-            columnspan=2,
-            sticky="w",
-            pady=(0, 12)
-        )
-
-        # SENSOR VALUES
-        sensor_names = [
-            ("water_level", "Water Level"),
-            ("salinity", "Salinity"),
-            ("water_temperature", "Water Temp"),
-            ("air_temperature", "Air Temp"),
-            ("humidity", "Humidity"),
-            ("ph", "pH")
-        ]
-
-        sensor_labels = {}
-
-        for sensor_index, (key, name) in enumerate(sensor_names):
-            label = tk.Label(
-                card,
-                text=name,
-                font=("Arial", 12)
-            )
-
-            label.grid(
-                row=sensor_index + 2,
-                column=0,
-                sticky="w",
-                pady=3
-            )
-
-            value_label = tk.Label(
-                card,
-                text="-",
-                font=("Arial", 12, "bold")
-            )
-
-            value_label.grid(
-                row=sensor_index + 2,
-                column=1,
-                sticky="e",
-                pady=3
-            )
-
-            sensor_labels[key] = value_label
-
-        toggle_button = tk.Button(
-            card,
-            text="-",
-            font=("Arial", 13, "bold"),
-            height=2,
-            command=lambda d=device_id: toggle_tunnel_status(d)
-        )
-
-        toggle_button.grid(
-            row=8,
-            column=0,
-            columnspan=2,
-            sticky="ew",
-            pady=(15, 0)
-        )
-
-        card.columnconfigure(0, weight=1)
-        card.columnconfigure(1, weight=1)
-
-        tunnel_widgets[device_id] = {
-            "status": status_label,
-            "transfer": transfer_label,
-            "toggle": toggle_button,
-            "sensors": sensor_labels
-        }
-
-    for column in range(3):
-        tunnel_frame.columnconfigure(
-            column,
-            weight=1,
-            uniform="tunnel_columns"
-        )
-
-    for row in range((len(TUNNELS) + 2) // 3):
-        tunnel_frame.rowconfigure(row, weight=1)
+    if TUNNELS:
+        device_id = selected_device_id if find_tunnel(selected_device_id) else TUNNELS[0]["device_id"]
+        select_tunnel(device_id)
+    else:
+        detail_title.config(text="No tunnels configured")
 
 def update_gui():
     for tunnel in TUNNELS:
         device_id = tunnel["device_id"]
-
-        widgets = tunnel_widgets.get(device_id)
-
-        if widgets is None:
+        if device_id != selected_device_id or not detail_widgets:
             continue
 
-        # STATUS
-        if tunnel["is_enabled"]:
-            widgets["status"].config(
-                text="ENABLED"
-            )
-
-            widgets["toggle"].config(
-                text="DISABLE"
-            )
-
-        else:
-            widgets["status"].config(
-                text="DISABLED"
-            )
-
-            widgets["toggle"].config(
-                text="ENABLE"
-            )
-
-        # TRANSFER
-        if device_id in process_map:
-            message_id = process_map[device_id]
-
-            widgets["transfer"].config(
-                text=f"TRANSFERRING"
-            )
-
-        else:
-            widgets["transfer"].config(
-                text="IDLE"
-            )
-
-        # TELEMETRY
+        update_detail_status(tunnel)
         telemetry = latest_telemetry.get(device_id)
-
         if telemetry is None:
-            for label in widgets["sensors"].values():
+            for label in detail_widgets["sensors"].values():
                 label.config(text="-")
-
         else:
             water_temperature = telemetry["water_temperature"]
             air_temperature = telemetry["air_temperature"]
             humidity = telemetry["humidity"]
             ph = telemetry["ph"]
-
-            widgets["sensors"]["water_level"].config(
-                text=str(telemetry["water_level"])
+            detail_widgets["sensors"]["water_level"].config(text=str(telemetry["water_level"]))
+            detail_widgets["sensors"]["salinity"].config(text=f'{telemetry["salinity"]:.2f} ppt')
+            detail_widgets["sensors"]["water_temperature"].config(
+                text="N/A" if water_temperature is None else f"{water_temperature:.2f} °C"
             )
-
-            widgets["sensors"]["salinity"].config(
-                text=f'{telemetry["salinity"]:.2f} ppt'
+            detail_widgets["sensors"]["air_temperature"].config(
+                text="N/A" if air_temperature is None else f"{air_temperature:.2f} °C"
             )
-
-            widgets["sensors"]["water_temperature"].config(
-                text="N/A"
-                if water_temperature is None
-                else f"{water_temperature:.2f} °C"
+            detail_widgets["sensors"]["humidity"].config(
+                text="N/A" if humidity is None else f"{humidity:.2f} %"
             )
-
-            widgets["sensors"]["air_temperature"].config(
-                text="N/A"
-                if air_temperature is None
-                else f"{air_temperature:.2f} °C"
-            )
-
-            widgets["sensors"]["humidity"].config(
-                text="N/A"
-                if humidity is None
-                else f"{humidity:.2f} %"
-            )
-
-            widgets["sensors"]["ph"].config(
-                text="N/A"
-                if ph is None
-                else f"{ph:.2f}"
+            detail_widgets["sensors"]["ph"].config(
+                text="N/A" if ph is None else f"{ph:.2f}"
             )
 
     root.after(250, update_gui)
@@ -378,6 +287,20 @@ def find_tunnel(device_id):
     return None
 
 
+def get_next_device_id():
+    device_numbers = [
+        int(match.group(1))
+        for tunnel in TUNNELS
+        if (match := re.fullmatch(r"A(\d{4})", tunnel["device_id"]))
+    ]
+    next_number = max(device_numbers, default=0) + 1
+
+    if next_number > 9999:
+        raise ValueError("No available tunnel IDs remain.")
+
+    return f"A{next_number:04d}"
+
+
 
 # MESSAGE ID
 
@@ -424,6 +347,177 @@ def build_start_transfer(device_id, message_id, min_level):
 def save_config():
     with open("config.json", "w", encoding="utf-8") as file:
         json.dump(config, file, indent=2)
+
+def open_edit_tunnel_dialog(device_id):
+    tunnel = find_tunnel(device_id)
+    if tunnel is None:
+        return
+
+    dialog = tk.Toplevel(root)
+    dialog.title(f"Edit tunnel {device_id}")
+    dialog.resizable(False, False)
+    dialog.transient(root)
+    dialog.grab_set()
+
+    form = tk.Frame(dialog, padx=20, pady=15)
+    form.pack()
+    tk.Label(form, text="Device ID", font=("Arial", 11)).grid(
+        row=0, column=0, sticky="w", padx=(0, 12), pady=6
+    )
+    tk.Label(form, text=device_id, font=("Arial", 11, "bold")).grid(
+        row=0, column=1, sticky="w", pady=6
+    )
+
+    tk.Label(form, text="Role", font=("Arial", 11)).grid(
+        row=1, column=0, sticky="w", padx=(0, 12), pady=6
+    )
+    role_combo = ttk.Combobox(
+        form,
+        values=ROLE_OPTIONS,
+        state="readonly",
+        width=20,
+        font=("Arial", 11)
+    )
+    current_role = tunnel.get("role", "BACK").upper()
+    role_combo.set(current_role if current_role in ROLE_OPTIONS else "BACK")
+    role_combo.grid(row=1, column=1, pady=6)
+
+    tk.Label(form, text="Target Be (Baume)", font=("Arial", 11)).grid(
+        row=2, column=0, sticky="w", padx=(0, 12), pady=6
+    )
+    baume_entry = tk.Entry(form, width=22, font=("Arial", 11))
+    baume_entry.insert(
+        0,
+        str(tunnel.get("thresholds", {}).get("baume_target", 0))
+    )
+    baume_entry.grid(row=2, column=1, pady=6)
+
+    def save_changes():
+        role = role_combo.get().strip().upper()
+        baume_text = baume_entry.get().strip()
+
+        try:
+            baume_target = float(baume_text)
+        except ValueError:
+            messagebox.showerror(
+                "Invalid target",
+                "Target Be (Baume) must be a number.",
+                parent=dialog
+            )
+            return
+        if baume_target < 0:
+            messagebox.showerror(
+                "Invalid target",
+                "Target Be (Baume) cannot be negative.",
+                parent=dialog
+            )
+            return
+
+        tunnel["role"] = role
+        tunnel.setdefault("thresholds", {})["baume_target"] = baume_target
+        save_config()
+        create_tunnel_view()
+        dialog.destroy()
+
+    buttons = tk.Frame(form)
+    buttons.grid(row=3, column=0, columnspan=2, pady=(12, 0))
+    tk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side="left", padx=5)
+    tk.Button(buttons, text="Save", command=save_changes).pack(side="left", padx=5)
+    role_combo.focus_set()
+
+def open_add_tunnel_dialog():
+    try:
+        device_id = get_next_device_id()
+    except ValueError as error:
+        messagebox.showerror("Cannot add tunnel", str(error), parent=root)
+        return
+
+    dialog = tk.Toplevel(root)
+    dialog.title("Add tunnel")
+    dialog.resizable(False, False)
+    dialog.transient(root)
+    dialog.grab_set()
+
+    form = tk.Frame(dialog, padx=20, pady=15)
+    form.pack()
+    entries = {}
+    tk.Label(form, text="Device ID", font=("Arial", 11)).grid(
+        row=0, column=0, sticky="w", padx=(0, 12), pady=6
+    )
+    tk.Label(form, text=device_id, font=("Arial", 11, "bold")).grid(
+        row=0, column=1, sticky="w", pady=6
+    )
+
+    tk.Label(form, text="Role", font=("Arial", 11)).grid(
+        row=1, column=0, sticky="w", padx=(0, 12), pady=6
+    )
+    role_combo = ttk.Combobox(
+        form,
+        values=ROLE_OPTIONS,
+        state="readonly",
+        width=20,
+        font=("Arial", 11)
+    )
+    role_combo.set("BACK")
+    role_combo.grid(row=1, column=1, pady=6)
+    entries["role"] = role_combo
+
+    tk.Label(form, text="Target Be (Baume)", font=("Arial", 11)).grid(
+        row=2, column=0, sticky="w", padx=(0, 12), pady=6
+    )
+    baume_entry = tk.Entry(form, width=22, font=("Arial", 11))
+    baume_entry.grid(row=2, column=1, pady=6)
+    entries["baume_target"] = baume_entry
+
+    def add_tunnel():
+        role = entries["role"].get().strip().upper()
+        baume_text = entries["baume_target"].get().strip()
+
+        if find_tunnel(device_id) is not None:
+            messagebox.showerror(
+                "Duplicate device ID",
+                f"Tunnel {device_id} already exists.",
+                parent=dialog
+            )
+            return
+        try:
+            baume_target = float(baume_text)
+        except ValueError:
+            messagebox.showerror(
+                "Invalid target",
+                "Target Be (Baume) must be a number.",
+                parent=dialog
+            )
+            return
+        if baume_target < 0:
+            messagebox.showerror(
+                "Invalid target",
+                "Target Be (Baume) cannot be negative.",
+                parent=dialog
+            )
+            return
+
+        TUNNELS.append({
+            "device_id": device_id,
+            "role": role,
+            "is_enabled": False,
+            "has_ph_meter": False,
+            "thresholds": {
+                "water_level_target": 0,
+                "min_level": 0,
+                "salinity_target": 0,
+                "baume_target": baume_target
+            }
+        })
+        save_config()
+        create_tunnel_view()
+        dialog.destroy()
+
+    buttons = tk.Frame(form)
+    buttons.grid(row=3, column=0, columnspan=2, pady=(12, 0))
+    tk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side="left", padx=5)
+    tk.Button(buttons, text="Add", command=add_tunnel).pack(side="left", padx=5)
+    role_combo.focus_set()
 
 def toggle_tunnel_status(device_id):
     tunnel = find_tunnel(device_id)
@@ -767,7 +861,7 @@ def on_close():
 
 # START GUI
 
-create_tunnel_cards()
+create_tunnel_view()
 
 process_incoming_queue()
 update_gui()

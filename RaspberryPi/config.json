@@ -8,9 +8,10 @@
       "thresholds": {
         "water_level_target": 550,
         "min_level": 500,
-        "salinity_target": 0
+        "salinity_target": 0,
+        "baume_target": 19.0
       }
-    },
+    },  
     {
       "device_id": "A0002",
       "role": "MIDDLE",
@@ -19,7 +20,8 @@
       "thresholds": {
         "water_level_target": 600,
         "min_level": 550,
-        "salinity_target": 0
+        "salinity_target": 0,
+        "baume_target": 0.0
       }
     },
     {
@@ -30,7 +32,8 @@
       "thresholds": {
         "water_level_target": 550,
         "min_level": 300,
-        "salinity_target": 200
+        "salinity_target": 200,
+        "baume_target": 0.0
       }
     },
     {
@@ -41,7 +44,8 @@
       "thresholds": {
         "water_level_target": 550,
         "min_level": 300,
-        "salinity_target": 200
+        "salinity_target": 200,
+        "baume_target": 0.0
       }
     },
     {
@@ -52,7 +56,20 @@
       "thresholds": {
         "water_level_target": 550,
         "min_level": 300,
-        "salinity_target": 200
+        "salinity_target": 200,
+        "baume_target": 0.0
+      }
+    },
+    {
+      "device_id": "A0006",
+      "role": "MIDDLE",
+      "is_enabled": true,
+      "has_ph_meter": false,
+      "thresholds": {
+        "water_level_target": 0,
+        "min_level": 0,
+        "salinity_target": 0,
+        "baume_target": 30.0
       }
     }
   ]
