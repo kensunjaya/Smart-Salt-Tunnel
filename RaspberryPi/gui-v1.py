@@ -14,12 +14,35 @@ latest_telemetry = {}
 tunnel_widgets = {}
 selected_device_id = None
 ROLE_OPTIONS = ("FRONT", "MIDDLE", "BACK")
+latest_windspeed = None
+COLORS = {
+    "background": "#eaf6ff",
+    "panel": "#d9efff",
+    "accent": "#9ed8f5",
+    "accent_active": "#78c5eb",
+    "text": "#16324f",
+    "white": "#ffffff"
+}
 
 root = tk.Tk()
 root.title("Smart Salt Tunnel")
 root.geometry("1024x600")
+root.configure(bg=COLORS["background"])
+root.option_add("*Background", COLORS["panel"])
+root.option_add("*Foreground", COLORS["text"])
+root.option_add("*Button.Background", COLORS["accent"])
+root.option_add("*Button.Foreground", COLORS["text"])
+root.option_add("*Button.ActiveBackground", COLORS["accent_active"])
+root.option_add("*Button.ActiveForeground", COLORS["text"])
+style = ttk.Style(root)
+style.configure(
+    "Blue.Vertical.TScrollbar",
+    troughcolor=COLORS["panel"],
+    background=COLORS["accent"],
+    arrowcolor=COLORS["text"]
+)
 
-main_frame = tk.Frame(root)
+main_frame = tk.Frame(root, bg=COLORS["background"])
 main_frame.pack(fill="both", expand=True, padx=20, pady=10)
 
 sidebar = tk.LabelFrame(
@@ -27,12 +50,11 @@ sidebar = tk.LabelFrame(
     text="Tunnels",
     font=("Arial", 14, "bold"),
     padx=8,
-    pady=8
+    pady=8,
+    width=180
 )
 sidebar.pack(side="left", fill="y")
-
-tunnel_list_frame = tk.Frame(sidebar)
-tunnel_list_frame.pack(fill="both", expand=True)
+sidebar.pack_propagate(False)
 
 add_tunnel_button = tk.Button(
     sidebar,
@@ -40,7 +62,75 @@ add_tunnel_button = tk.Button(
     font=("Arial", 12, "bold"),
     command=lambda: open_add_tunnel_dialog()
 )
-add_tunnel_button.pack(fill="x", pady=(10, 0))
+add_tunnel_button.pack(fill="x", pady=(0, 10))
+
+tunnel_list_canvas = tk.Canvas(
+    sidebar, highlightthickness=0, bg=COLORS["panel"]
+)
+tunnel_list_scrollbar = ttk.Scrollbar(
+    sidebar,
+    orient="vertical",
+    command=tunnel_list_canvas.yview,
+    style="Blue.Vertical.TScrollbar"
+)
+tunnel_list_frame = tk.Frame(tunnel_list_canvas, bg=COLORS["panel"])
+tunnel_list_window = tunnel_list_canvas.create_window(
+    (0, 0), window=tunnel_list_frame, anchor="nw"
+)
+tunnel_list_canvas.configure(yscrollcommand=tunnel_list_scrollbar.set)
+tunnel_list_canvas.pack(side="left", fill="both", expand=True)
+tunnel_list_scrollbar.pack(side="right", fill="y")
+tunnel_list_frame.bind(
+    "<Configure>",
+    lambda event: tunnel_list_canvas.configure(
+        scrollregion=tunnel_list_canvas.bbox("all")
+    )
+)
+tunnel_list_canvas.bind(
+    "<Configure>",
+    lambda event: tunnel_list_canvas.itemconfigure(
+        tunnel_list_window, width=event.width
+    )
+)
+
+def scroll_tunnel_list(event):
+    event_num = getattr(event, "num", None)
+    if event_num == 4:
+        tunnel_list_canvas.yview_scroll(-1, "units")
+    elif event_num == 5:
+        tunnel_list_canvas.yview_scroll(1, "units")
+    elif getattr(event, "delta", 0):
+        tunnel_list_canvas.yview_scroll(-int(event.delta / 120), "units")
+
+tunnel_list_canvas.bind("<MouseWheel>", scroll_tunnel_list)
+tunnel_list_canvas.bind("<Button-4>", scroll_tunnel_list)
+tunnel_list_canvas.bind("<Button-5>", scroll_tunnel_list)
+tunnel_list_frame.bind("<MouseWheel>", scroll_tunnel_list)
+tunnel_list_frame.bind("<Button-4>", scroll_tunnel_list)
+tunnel_list_frame.bind("<Button-5>", scroll_tunnel_list)
+
+wind_sidebar = tk.LabelFrame(
+    main_frame,
+    text="Anemometer",
+    font=("Arial", 14, "bold"),
+    padx=12,
+    pady=12
+)
+wind_sidebar.pack(side="right", fill="y", padx=(15, 0))
+
+tk.Label(
+    wind_sidebar,
+    text="Windspeed",
+    font=("Arial", 12),
+    bg=COLORS["panel"]
+).pack(anchor="w")
+windspeed_label = tk.Label(
+    wind_sidebar,
+    text="N/A",
+    font=("Arial", 18, "bold"),
+    bg=COLORS["panel"]
+)
+windspeed_label.pack(anchor="w", pady=(8, 0))
 
 detail_frame = tk.LabelFrame(
     main_frame,
@@ -69,8 +159,17 @@ def select_tunnel(device_id):
     update_detail_status(tunnel)
 
 def get_tunnel_detail_value(tunnel, key):
-    if key == "target_be":
-        return f'{tunnel.get("thresholds", {}).get("baume_target", 0):g} °Be'
+    thresholds = tunnel.get("thresholds", {})
+    if key == "salinity_target":
+        return (
+            f'{thresholds.get("min_salinity", 0):g} - '
+            f'{thresholds.get("salinity_target", 0):g} ppt'
+        )
+    if key == "water_level_target":
+        return (
+            f'{thresholds.get("min_level", 0):g} - '
+            f'{thresholds.get("water_level_target", 0):g}'
+        )
     return str(tunnel.get(key, "-"))
 
 def update_detail_status(tunnel):
@@ -78,9 +177,9 @@ def update_detail_status(tunnel):
     detail_widgets["edit"].config(
         command=lambda d=tunnel["device_id"]: open_edit_tunnel_dialog(d)
     )
-    detail_widgets["status"].config(text="ENABLED" if enabled else "DISABLED")
+    detail_widgets["status"].config(text="Enabled" if enabled else "Disabled")
     detail_widgets["toggle"].config(
-        text="DISABLE" if enabled else "ENABLE",
+        text="Disable" if enabled else "Enable",
         command=lambda d=tunnel["device_id"]: toggle_tunnel_status(d)
     )
     detail_widgets["transfer"].config(
@@ -108,6 +207,9 @@ def create_tunnel_view():
             command=lambda d=device_id: select_tunnel(d)
         )
         button.pack(fill="x", pady=3)
+        button.bind("<MouseWheel>", scroll_tunnel_list)
+        button.bind("<Button-4>", scroll_tunnel_list)
+        button.bind("<Button-5>", scroll_tunnel_list)
 
     status_label = tk.Label(detail_frame, text="-", font=("Arial", 14, "bold"))
     status_label.pack(anchor="w")
@@ -118,9 +220,8 @@ def create_tunnel_view():
     info_frame.pack(fill="x")
     info_widgets = {}
     for key, name in [
-        ("device_id", "Device ID"),
-        ("role", "Role"),
-        ("target_be", "Target Be (Baume)")
+        ("salinity_target", "Salinity target (ppt)"),
+        ("water_level_target", "Water level target")
     ]:
         tk.Label(info_frame, text=name, font=("Arial", 12)).grid(
             row=len(info_widgets), column=0, sticky="w", pady=4
@@ -149,15 +250,22 @@ def create_tunnel_view():
         value_label.grid(row=sensor_index, column=1, sticky="w", padx=20, pady=3)
         sensor_labels[key] = value_label
 
+    action_frame = tk.Frame(detail_frame)
+    action_frame.pack(fill="x", pady=(20, 0))
     edit_button = tk.Button(
-        detail_frame,
+        action_frame,
         text="Edit tunnel",
-        font=("Arial", 12, "bold")
+        font=("Arial", 12, "bold"),
+        height=2
     )
-    edit_button.pack(fill="x", pady=(20, 0))
+    edit_button.grid(row=0, column=0, sticky="nsew")
 
-    toggle_button = tk.Button(detail_frame, text="-", font=("Arial", 13, "bold"), height=2)
-    toggle_button.pack(fill="x", pady=(20, 0))
+    toggle_button = tk.Button(
+        action_frame, text="-", font=("Arial", 13, "bold"), height=2
+    )
+    toggle_button.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+    action_frame.columnconfigure(0, weight=1, uniform="tunnel-actions")
+    action_frame.columnconfigure(1, weight=1, uniform="tunnel-actions")
     detail_widgets.update({
         "status": status_label,
         "transfer": transfer_label,
@@ -174,6 +282,11 @@ def create_tunnel_view():
         detail_title.config(text="No tunnels configured")
 
 def update_gui():
+    if latest_windspeed is None:
+        windspeed_label.config(text="N/A")
+    else:
+        windspeed_label.config(text=f"{latest_windspeed:.2f} m/s")
+
     for tunnel in TUNNELS:
         device_id = tunnel["device_id"]
         if device_id != selected_device_id or not detail_widgets:
@@ -361,15 +474,8 @@ def open_edit_tunnel_dialog(device_id):
 
     form = tk.Frame(dialog, padx=20, pady=15)
     form.pack()
-    tk.Label(form, text="Device ID", font=("Arial", 11)).grid(
-        row=0, column=0, sticky="w", padx=(0, 12), pady=6
-    )
-    tk.Label(form, text=device_id, font=("Arial", 11, "bold")).grid(
-        row=0, column=1, sticky="w", pady=6
-    )
-
     tk.Label(form, text="Role", font=("Arial", 11)).grid(
-        row=1, column=0, sticky="w", padx=(0, 12), pady=6
+        row=0, column=0, sticky="w", padx=(0, 12), pady=6
     )
     role_combo = ttk.Combobox(
         form,
@@ -380,54 +486,86 @@ def open_edit_tunnel_dialog(device_id):
     )
     current_role = tunnel.get("role", "BACK").upper()
     role_combo.set(current_role if current_role in ROLE_OPTIONS else "BACK")
-    role_combo.grid(row=1, column=1, pady=6)
+    role_combo.grid(row=0, column=1, pady=6)
 
-    tk.Label(form, text="Target Be (Baume)", font=("Arial", 11)).grid(
-        row=2, column=0, sticky="w", padx=(0, 12), pady=6
+    tk.Label(form, text="Salinity target (ppt)", font=("Arial", 11)).grid(
+        row=1, column=0, sticky="w", padx=(0, 12), pady=6
     )
-    baume_entry = tk.Entry(form, width=22, font=("Arial", 11))
-    baume_entry.insert(
-        0,
-        str(tunnel.get("thresholds", {}).get("baume_target", 0))
+    thresholds = tunnel.setdefault("thresholds", {})
+    min_salinity_entry = tk.Entry(form, width=10, font=("Arial", 11))
+    min_salinity_entry.insert(0, str(thresholds.get("min_salinity", 0)))
+    min_salinity_entry.grid(row=1, column=1, sticky="w", pady=6)
+    salinity_target_entry = tk.Entry(form, width=10, font=("Arial", 11))
+    salinity_target_entry.insert(0, str(thresholds.get("salinity_target", 0)))
+    salinity_target_entry.grid(row=1, column=1, padx=(115, 0), pady=6)
+    tk.Label(form, text="min                 max", font=("Arial", 8)).grid(
+        row=2, column=1, sticky="w", padx=(2, 0)
     )
-    baume_entry.grid(row=2, column=1, pady=6)
+    tk.Label(form, text="Water level target", font=("Arial", 11)).grid(
+        row=3, column=0, sticky="w", padx=(0, 12), pady=6
+    )
+    min_level_entry = tk.Entry(form, width=10, font=("Arial", 11))
+    min_level_entry.insert(0, str(thresholds.get("min_level", 0)))
+    min_level_entry.grid(row=3, column=1, sticky="w", pady=6)
+    water_level_target_entry = tk.Entry(form, width=10, font=("Arial", 11))
+    water_level_target_entry.insert(
+        0, str(thresholds.get("water_level_target", 0))
+    )
+    water_level_target_entry.grid(row=3, column=1, padx=(115, 0), pady=6)
+    tk.Label(form, text="min                 max", font=("Arial", 8)).grid(
+        row=4, column=1, sticky="w", padx=(2, 0)
+    )
 
     def save_changes():
         role = role_combo.get().strip().upper()
-        baume_text = baume_entry.get().strip()
+        min_salinity_text = min_salinity_entry.get().strip()
+        salinity_target_text = salinity_target_entry.get().strip()
+        min_level_text = min_level_entry.get().strip()
+        water_level_target_text = water_level_target_entry.get().strip()
 
         try:
-            baume_target = float(baume_text)
+            min_salinity = float(min_salinity_text)
+            salinity_target = float(salinity_target_text)
+            min_level = float(min_level_text)
+            water_level_target = float(water_level_target_text)
         except ValueError:
             messagebox.showerror(
                 "Invalid target",
-                "Target Be (Baume) must be a number.",
+                "All target values must be numbers.",
                 parent=dialog
             )
             return
-        if baume_target < 0:
+        if (
+            min_salinity < 0 or salinity_target < 0
+            or min_level < 0 or water_level_target < 0
+            or min_salinity > salinity_target
+            or min_level > water_level_target
+        ):
             messagebox.showerror(
                 "Invalid target",
-                "Target Be (Baume) cannot be negative.",
+                "Targets must be non-negative and each min must not exceed its max.",
                 parent=dialog
             )
             return
 
         tunnel["role"] = role
-        tunnel.setdefault("thresholds", {})["baume_target"] = baume_target
+        thresholds["min_salinity"] = min_salinity
+        thresholds["salinity_target"] = salinity_target
+        thresholds["min_level"] = min_level
+        thresholds["water_level_target"] = water_level_target
         save_config()
         create_tunnel_view()
         dialog.destroy()
 
     buttons = tk.Frame(form)
-    buttons.grid(row=3, column=0, columnspan=2, pady=(12, 0))
+    buttons.grid(row=5, column=0, columnspan=2, pady=(12, 0))
     tk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side="left", padx=5)
     tk.Button(buttons, text="Save", command=save_changes).pack(side="left", padx=5)
     role_combo.focus_set()
 
 def open_add_tunnel_dialog():
     try:
-        device_id = get_next_device_id()
+        suggested_device_id = get_next_device_id()
     except ValueError as error:
         messagebox.showerror("Cannot add tunnel", str(error), parent=root)
         return
@@ -444,9 +582,10 @@ def open_add_tunnel_dialog():
     tk.Label(form, text="Device ID", font=("Arial", 11)).grid(
         row=0, column=0, sticky="w", padx=(0, 12), pady=6
     )
-    tk.Label(form, text=device_id, font=("Arial", 11, "bold")).grid(
-        row=0, column=1, sticky="w", pady=6
-    )
+    device_id_entry = tk.Entry(form, width=22, font=("Arial", 11))
+    device_id_entry.insert(0, suggested_device_id)
+    device_id_entry.grid(row=0, column=1, pady=6)
+    entries["device_id"] = device_id_entry
 
     tk.Label(form, text="Role", font=("Arial", 11)).grid(
         row=1, column=0, sticky="w", padx=(0, 12), pady=6
@@ -462,17 +601,45 @@ def open_add_tunnel_dialog():
     role_combo.grid(row=1, column=1, pady=6)
     entries["role"] = role_combo
 
-    tk.Label(form, text="Target Be (Baume)", font=("Arial", 11)).grid(
+    tk.Label(form, text="Salinity target (ppt)", font=("Arial", 11)).grid(
         row=2, column=0, sticky="w", padx=(0, 12), pady=6
     )
-    baume_entry = tk.Entry(form, width=22, font=("Arial", 11))
-    baume_entry.grid(row=2, column=1, pady=6)
-    entries["baume_target"] = baume_entry
+    min_salinity_entry = tk.Entry(form, width=10, font=("Arial", 11))
+    min_salinity_entry.grid(row=2, column=1, sticky="w", pady=6)
+    salinity_target_entry = tk.Entry(form, width=10, font=("Arial", 11))
+    salinity_target_entry.grid(row=2, column=1, padx=(115, 0), pady=6)
+    tk.Label(form, text="min                 max", font=("Arial", 8)).grid(
+        row=3, column=1, sticky="w", padx=(2, 0)
+    )
+
+    tk.Label(form, text="Water level target", font=("Arial", 11)).grid(
+        row=4, column=0, sticky="w", padx=(0, 12), pady=6
+    )
+    min_level_entry = tk.Entry(form, width=10, font=("Arial", 11))
+    min_level_entry.grid(row=4, column=1, sticky="w", pady=6)
+    water_level_target_entry = tk.Entry(form, width=10, font=("Arial", 11))
+    water_level_target_entry.grid(row=4, column=1, padx=(115, 0), pady=6)
+    tk.Label(form, text="min                 max", font=("Arial", 8)).grid(
+        row=5, column=1, sticky="w", padx=(2, 0)
+    )
 
     def add_tunnel():
+        device_id = entries["device_id"].get().strip()
         role = entries["role"].get().strip().upper()
-        baume_text = entries["baume_target"].get().strip()
+        values = (
+            min_salinity_entry.get().strip(),
+            salinity_target_entry.get().strip(),
+            min_level_entry.get().strip(),
+            water_level_target_entry.get().strip()
+        )
 
+        if not re.fullmatch(r"[A-Za-z0-9]{5}", device_id):
+            messagebox.showerror(
+                "Invalid device ID",
+                "Device ID must contain exactly 5 letters or numbers.",
+                parent=dialog
+            )
+            return
         if find_tunnel(device_id) is not None:
             messagebox.showerror(
                 "Duplicate device ID",
@@ -481,18 +648,25 @@ def open_add_tunnel_dialog():
             )
             return
         try:
-            baume_target = float(baume_text)
+            min_salinity, salinity_target, min_level, water_level_target = (
+                float(value) for value in values
+            )
         except ValueError:
             messagebox.showerror(
                 "Invalid target",
-                "Target Be (Baume) must be a number.",
+                "All target values must be numbers.",
                 parent=dialog
             )
             return
-        if baume_target < 0:
+        if (
+            min_salinity < 0 or salinity_target < 0
+            or min_level < 0 or water_level_target < 0
+            or min_salinity > salinity_target
+            or min_level > water_level_target
+        ):
             messagebox.showerror(
                 "Invalid target",
-                "Target Be (Baume) cannot be negative.",
+                "Targets must be non-negative and each min must not exceed its max.",
                 parent=dialog
             )
             return
@@ -503,10 +677,10 @@ def open_add_tunnel_dialog():
             "is_enabled": False,
             "has_ph_meter": False,
             "thresholds": {
-                "water_level_target": 0,
-                "min_level": 0,
-                "salinity_target": 0,
-                "baume_target": baume_target
+                "water_level_target": water_level_target,
+                "min_level": min_level,
+                "salinity_target": salinity_target,
+                "min_salinity": min_salinity
             }
         })
         save_config()
@@ -514,10 +688,10 @@ def open_add_tunnel_dialog():
         dialog.destroy()
 
     buttons = tk.Frame(form)
-    buttons.grid(row=3, column=0, columnspan=2, pady=(12, 0))
+    buttons.grid(row=6, column=0, columnspan=2, pady=(12, 0))
     tk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side="left", padx=5)
     tk.Button(buttons, text="Add", command=add_tunnel).pack(side="left", padx=5)
-    role_combo.focus_set()
+    device_id_entry.focus_set()
 
 def toggle_tunnel_status(device_id):
     tunnel = find_tunnel(device_id)
