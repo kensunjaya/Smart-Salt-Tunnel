@@ -7,6 +7,9 @@ import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+from salinity_conversion import konversi_salinitas
+from ph_conversion import adc_ke_ph
+
 from pyrf24 import RF24, RF24_250KBPS, RF24_PA_LOW
 
 
@@ -872,9 +875,9 @@ def handle_telemetry(raw):
     humidity = None if humidity_raw == -1 else humidity_raw / 100.0
 
     water_level = water_level_raw
-    salinity = salinity_raw / 100.0
+    salinity = konversi_salinitas(salinity_raw, water_temperature) # fungsi konversi salinitas dari salinity_conversion.py
 
-    ph = None if ph_raw == -1 else ph_raw / 100.0
+    ph = adc_ke_ph(ph_raw) if ph_raw != -1 else None
 
 
     latest_telemetry[device_id] = {

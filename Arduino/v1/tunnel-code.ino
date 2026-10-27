@@ -20,6 +20,9 @@ Last Updated: 22 September 2026
 #define WATER_TEMP_PIN A3
 #define DMS_S_PIN 6
 #define DMS_ANALOG_PIN A0
+#define PH_PIN A1
+
+#define HAS_PH_SENSOR 0
 
 Adafruit_HTU21DF htu = Adafruit_HTU21DF();
 OneWire oneWire(WATER_TEMP_PIN);
@@ -474,8 +477,16 @@ int16_t getHumidity() {
 }
 
 int16_t getPH() {
-  // TODO
-  return -1;
+  if (!HAS_PH_SENSOR) return -1;
+
+  uint32_t total = 0;
+
+  for (uint8_t i = 0; i < 10; i++) {
+    total += analogRead(PH_PIN);
+    delay(10);
+  }
+
+  return (int16_t)((total + 5) / 10);
 }
 
 uint16_t getSalinityADC(uint8_t pin, uint8_t sample_count) {
@@ -515,24 +526,10 @@ uint16_t getSalinity() {
 
   digitalWrite(DMS_S_PIN, HIGH); // DMS OFF
 
-  // ADC -> konduktivitas (uS/cm)
-  // ini masih pakai kalibrasi bawaan dari penjual
-  float conductivity = (0.2142f * adc_value) + 494.93f;
-
-  // konduktivitas -> salinitas (ppt)
-  float salinity = conductivity * 0.00064f;
-
   Serial.print(F("Salinity ADC="));
-  Serial.print(adc_value);
+  Serial.println(adc_value);
 
-  Serial.print(F(" conductivity="));
-  Serial.print(conductivity, 2);
-
-  Serial.print(F(" uS/cm salinity="));
-  Serial.print(salinity, 2);
-  Serial.println(F(" ppt"));
-
-  return (uint16_t)(salinity * 100.0f + 0.5f);
+  return adc_value;
 }
 
 uint16_t getWaterLevel() {
@@ -606,8 +603,8 @@ void sendTelemetry() {
   Serial.print(F(" water_level="));
   Serial.print(water_level);
 
-  Serial.print(F(" salinity="));
-  Serial.print(salinity / 100.0);
+  Serial.print(F(" salinity_adc="));
+  Serial.print(salinity);
 
   Serial.print(F(" water_temp="));
   Serial.print(water_temp / 100.0);
@@ -659,7 +656,7 @@ void setup() {
   Serial.print(F("[LOADED] Device ID: "));
   Serial.println((char*)DEVICE_ADDRESS);
 
-  randomSeed(analogRead(A1)); // random seed noise untuk jitter interval
+  randomSeed(micros()); // random seed noise untuk jitter interval
 
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, HIGH); // Relay OFF
