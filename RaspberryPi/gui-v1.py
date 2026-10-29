@@ -452,6 +452,11 @@ def build_register_ack(device_id, status):
 
 
 def build_start_transfer(device_id, message_id, min_level):
+    min_level = int(round(min_level))
+
+    if not 0 <= min_level <= 1023:
+        raise ValueError("min_level harus berada dalam rentang ADC 0-1023")
+
     packet = struct.pack(
         "<B5sIH",
         MSG_START_TRANSFER,
@@ -459,6 +464,7 @@ def build_start_transfer(device_id, message_id, min_level):
         message_id,
         min_level
     )
+
     return packet.ljust(PAYLOAD_SIZE, b"\x00")
 
 
