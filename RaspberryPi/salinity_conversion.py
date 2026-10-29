@@ -71,7 +71,7 @@ def adc_ke_ppt(adc, suhu):
     kurva = kurva_adc(suhu)
 
     if adc < kurva[0]:
-        return 0.0
+        return float(np.interp(adc, [0, kurva[0]], [0, PPT[0]]))
 
     # Linear interpolation (untuk ADC dalam range kurva)
     if adc <= kurva[-1]:
