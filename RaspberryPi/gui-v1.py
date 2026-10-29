@@ -306,7 +306,9 @@ def update_gui():
             humidity = telemetry["humidity"]
             ph = telemetry["ph"]
             detail_widgets["sensors"]["water_level"].config(text=str(telemetry["water_level"]))
-            detail_widgets["sensors"]["salinity"].config(text=f'{telemetry["salinity"]:.2f} ppt')
+            detail_widgets["sensors"]["salinity"].config(
+                text="N/A" if telemetry["salinity"] is None else f'{telemetry["salinity"]:.2f} ppt'
+            )
             detail_widgets["sensors"]["water_temperature"].config(
                 text="N/A" if water_temperature is None else f"{water_temperature:.2f} °C"
             )
@@ -875,7 +877,13 @@ def handle_telemetry(raw):
     humidity = None if humidity_raw == -1 else humidity_raw / 100.0
 
     water_level = water_level_raw
-    salinity = konversi_salinitas(salinity_raw, water_temperature) # fungsi konversi salinitas dari salinity_conversion.py
+
+    salinity_result = (
+        konversi_salinitas(salinity_raw, water_temperature)
+        if water_temperature is not None else None
+    )
+
+    salinity = salinity_result["ppt"] if salinity_result else None
 
     ph = adc_ke_ph(ph_raw) if ph_raw != -1 else None
 
@@ -916,6 +924,8 @@ def handle_telemetry(raw):
     air_temp_text = "N/A" if air_temperature is None else f"{air_temperature:.2f}"
     humidity_text = "N/A" if humidity is None else f"{humidity:.2f}"
     ph_text = "N/A" if ph is None else f"{ph:.2f}"
+    water_level_text = "N/A" if water_level is None else f"{water_level}"
+    salinity_text = "N/A" if salinity is None else f"{salinity:.2f}"
 
 
     print(
@@ -924,8 +934,8 @@ def handle_telemetry(raw):
         f"water={water_temp_text}C | "
         f"air={air_temp_text}C | "
         f"humidity={humidity_text}% | "
-        f"level={water_level} | "
-        f"salinity={salinity:.2f} | "
+        f"level={water_level_text} | "
+        f"salinity={salinity_text} ppt | "
         f"pH={ph_text}"
     )
 
@@ -945,11 +955,11 @@ def handle_telemetry(raw):
         request_start_transfer(device_id, min_level, process_map[device_id])
         return
 
-    if (salinity >= salinity_target and water_level >= water_level_target):
+    if (salinity is not None and water_level is not None and salinity >= salinity_target and water_level >= water_level_target):
         print(
             f"Threshold reached: "
-            f"salinity {salinity:.2f} >= {salinity_target}, "
-            f"water_level {water_level} >= {water_level_target}"
+            f"salinity {salinity_text} >= {salinity_target}, "
+            f"water_level {water_level_text} >= {water_level_target}"
         )
 
         request_start_transfer(device_id, min_level)
