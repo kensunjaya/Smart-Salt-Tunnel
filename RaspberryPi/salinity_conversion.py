@@ -71,7 +71,7 @@ def adc_ke_ppt(adc, suhu):
     kurva = kurva_adc(suhu)
 
     if adc < kurva[0]:
-        return None
+        return 0.0
 
     # Linear interpolation (untuk ADC dalam range kurva)
     if adc <= kurva[-1]:
@@ -93,6 +93,9 @@ def ppt_ke_sg(ppt, suhu):
 
     if not np.isfinite(ppt) or not np.isfinite(suhu) or ppt < 0:
         return None
+
+    if ppt == 0:
+        return 1.0
 
     suhu = np.clip(float(suhu), 0., 100.)
 
