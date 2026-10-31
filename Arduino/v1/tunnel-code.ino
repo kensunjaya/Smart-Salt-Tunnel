@@ -480,13 +480,23 @@ int16_t getPH() {
   if (!HAS_PH_SENSOR) return -1;
 
   uint32_t total = 0;
+  int16_t minVal = 1023;
+  int16_t maxVal = 0;
 
   for (uint8_t i = 0; i < 10; i++) {
-    total += analogRead(PH_PIN);
+    int16_t value = analogRead(PH_PIN);
+
+    total += value;
+
+    if (value < minVal) minVal = value;
+    if (value > maxVal) maxVal = value;
+
     delay(10);
   }
 
-  return (int16_t)((total + 5) / 10);
+  total -= minVal + maxVal;
+
+  return (int16_t)((total + 4) / 8);
 }
 
 uint16_t getSalinityADC(uint8_t pin, uint8_t sample_count) {
