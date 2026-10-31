@@ -1021,7 +1021,7 @@ def handle_telemetry(raw):
         return
 
     thresholds = tunnel['thresholds']
-    target_baume = thresholds['baume_target']
+    target_baume = thresholds['min_baume']
     target_level = thresholds['water_level_target']
     min_level = thresholds['min_level']
 
