@@ -3,8 +3,6 @@ import logging
 import sys
 import math
 import os
-import shutil
-from datetime import datetime
 import queue
 import re
 import struct
@@ -13,17 +11,16 @@ import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-from salinity_conversion import konversi_salinitas, ppt_ke_sg, sg_ke_baume
+from salinity_conversion import konversi_salinitas
 from ph_conversion import adc_ke_ph
 from water_level_conversion import adc_ke_mm, mm_ke_adc
 from wind_conversion import adc_ke_windspeed
 
 from pyrf24 import RF24, RF24_250KBPS, RF24_PA_LOW
 
-# INFO = events & telemetry, DEBUG = raw RF24 packets & threshold checks
 
+# LOGGING: INFO = events & telemetry, DEBUG = raw RF24 packets & threshold checks
 LOG_LEVEL = os.environ.get("SST_LOG_LEVEL", "DEBUG").upper()
-
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s.%(msecs)03d | %(levelname)-7s | %(threadName)s | %(message)s",
@@ -31,7 +28,6 @@ logging.basicConfig(
     stream=sys.stdout,
     force=True,
 )
-
 log = logging.getLogger("SmartSaltTunnel")
 
 
@@ -40,6 +36,7 @@ def fmt(value, digits=2):
 
 
 def update_telemetry_stats(device_id, sequence_id):
+    """Count sequence gaps as indications, not verified packet loss or physical TX."""
     stats = telemetry_stats.setdefault(device_id, {
         "received": 0, "lost": 0, "duplicates": 0,
         "last_sequence": None, "sequence_resets": 0,
@@ -54,11 +51,12 @@ def update_telemetry_stats(device_id, sequence_id):
         if sequence_id > last + 1:
             gap = sequence_id - last - 1
             stats["lost"] += gap
-            log.warning("[RADIO] %s gap seq=%d..%d (%d sequence tidak terlihat; total=%d)", device_id, last + 1, sequence_id - 1, gap, stats["lost"])
+            log.warning("[RADIO] %s gap seq=%d..%d (%d sequence tidak terlihat; total=%d)",
+                        device_id, last + 1, sequence_id - 1, gap, stats["lost"])
         elif sequence_id < last:
             stats["sequence_resets"] += 1
-            log.warning("[RADIO] %s sequence mundur %d -> %d (restart atau paket terlambat; cek node)", device_id, last, sequence_id)
-            
+            log.warning("[RADIO] %s sequence mundur %d -> %d (restart atau paket terlambat; cek node)",
+                        device_id, last, sequence_id)
     stats["received"] += 1
     stats["last_sequence"] = sequence_id
     return True
@@ -416,76 +414,6 @@ CHANNEL = 76
 TUNNELS = config["tunnels"]
 
 
-def migrate_legacy_ppt_thresholds():
-    """Migrasi sekali dari config PPT lama, dengan persetujuan pengguna."""
-    legacy = [t for t in TUNNELS if any(
-        k in t.get("thresholds", {}) for k in ("min_salinity", "salinity_target")
-    )]
-    if not legacy:
-        return
-
-    confirmed = messagebox.askyesno(
-        "Migrasi threshold salinitas",
-        "config.json masih menggunakan threshold PPT.\n\n"
-        "Konversikan threshold lama ke °Bé dengan suhu referensi 25°C?\n"
-        "Backup config.json akan dibuat terlebih dahulu.\n\n"
-        "Periksa kembali target °Bé sebelum mengaktifkan pompa.",
-        parent=root,
-    )
-    if not confirmed:
-        root.destroy()
-        raise SystemExit("Migrasi dibatalkan. Ubah threshold config.json ke °Bé sebelum menjalankan GUI.")
-
-    def convert(ppt):
-        ppt = float(ppt)
-        if not math.isfinite(ppt) or not 0 <= ppt <= 260:
-            raise ValueError("Threshold PPT lama harus bernilai 0–260 untuk migrasi otomatis.")
-        if ppt == 0:
-            return 0.0
-        return round(sg_ke_baume(ppt_ke_sg(ppt, 25.0)), 4)
-
-    try:
-        updates = []
-        for tunnel in legacy:
-            thresholds = tunnel["thresholds"]
-            min_baume = thresholds.get("min_baume")
-            baume_target = thresholds.get("baume_target")
-            if min_baume is None:
-                min_baume = convert(thresholds.get("min_salinity", 0))
-            if baume_target is None:
-                baume_target = convert(thresholds["salinity_target"])
-            if not (math.isfinite(float(min_baume)) and math.isfinite(float(baume_target))
-                    and 0 <= float(min_baume) <= float(baume_target)):
-                raise ValueError("Threshold °Bé hasil migrasi tidak valid.")
-            updates.append((thresholds, float(min_baume), float(baume_target)))
-
-        backup = "config.json.before_baume_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".bak"
-        shutil.copy2("config.json", backup)
-        for thresholds, min_baume, baume_target in updates:
-            thresholds["min_baume"] = min_baume
-            thresholds["baume_target"] = baume_target
-            thresholds.pop("min_salinity", None)
-            thresholds.pop("salinity_target", None)
-        # Hindari transfer otomatis dengan threshold yang baru dikonversi
-        for tunnel in TUNNELS:
-            tunnel["is_enabled"] = False
-        with open("config.json.tmp", "w", encoding="utf-8") as file:
-            json.dump(config, file, indent=2)
-        os.replace("config.json.tmp", "config.json")
-        log.warning('[CONFIG] Threshold lama PPT dimigrasi ke °Bé; backup=%s, seluruh tunnel DISABLED', backup)
-        messagebox.showinfo(
-            "Migrasi selesai",
-            f"Threshold sudah diubah ke °Bé.\nBackup: {backup}\n"
-            "Semua tunnel dinonaktifkan untuk keamanan. Periksa target °Bé sebelum mengaktifkan ulang.",
-            parent=root,
-        )
-    except (KeyError, ValueError, TypeError, OSError) as exc:
-        messagebox.showerror("Migrasi gagal", f"Tidak dapat mengonversi threshold lama: {exc}", parent=root)
-        root.destroy()
-        raise SystemExit("Migrasi config dibatalkan karena error.") from exc
-
-
-migrate_legacy_ppt_thresholds()
 for tunnel in TUNNELS:
     thresholds = tunnel.get("thresholds", {})
     if "baume_target" not in thresholds or "min_baume" not in thresholds:

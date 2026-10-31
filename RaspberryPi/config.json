@@ -8,8 +8,8 @@
       "thresholds": {
         "water_level_target": 550.0,
         "min_level": 500.0,
-        "salinity_target": 32.0,
-        "min_salinity": 30.0
+        "min_baume": 0.5,
+        "baume_target": 1.0
       }
     },
     {
@@ -20,8 +20,8 @@
       "thresholds": {
         "water_level_target": 600,
         "min_level": 550,
-        "salinity_target": 0,
-        "min_salinity": 0
+        "min_baume": 1.0,
+        "baume_target": 1.5
       }
     },
     {
@@ -30,10 +30,10 @@
       "is_enabled": true,
       "has_ph_meter": false,
       "thresholds": {
-        "water_level_target": 550,
-        "min_level": 300,
-        "salinity_target": 200,
-        "min_salinity": 0
+        "water_level_target": 750,
+        "min_level": 700,
+        "min_baume": 25.0,
+        "baume_target": 30.0
       }
     }
   ],
