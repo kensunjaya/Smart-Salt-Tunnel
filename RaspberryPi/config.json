@@ -36,5 +36,10 @@
         "min_salinity": 0
       }
     }
-  ]
+  ],
+  "tower": {
+    "device_id": "TOWER",
+    "role": "TOWER",
+    "is_enabled": true
+  }
 }

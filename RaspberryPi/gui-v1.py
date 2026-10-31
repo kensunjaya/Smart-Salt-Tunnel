@@ -9,6 +9,8 @@ from tkinter import messagebox, ttk
 
 from salinity_conversion import konversi_salinitas
 from ph_conversion import adc_ke_ph
+from water_level_conversion import adc_ke_mm, mm_ke_adc
+from wind_conversion import adc_ke_windspeed
 
 from pyrf24 import RF24, RF24_250KBPS, RF24_PA_LOW
 
@@ -18,6 +20,8 @@ tunnel_widgets = {}
 selected_device_id = None
 ROLE_OPTIONS = ("FRONT", "MIDDLE", "BACK")
 latest_windspeed = None
+last_wind_received = None
+WIND_STALE_SECONDS = 35.0
 COLORS = {
     "background": "#eaf6ff",
     "panel": "#d9efff",
@@ -134,6 +138,8 @@ windspeed_label = tk.Label(
     bg=COLORS["panel"]
 )
 windspeed_label.pack(anchor="w", pady=(8, 0))
+wind_status_label = tk.Label(wind_sidebar, text="TOWER: waiting", font=("Arial", 10), bg=COLORS["panel"])
+wind_status_label.pack(anchor="w", pady=(6, 0))
 
 detail_frame = tk.LabelFrame(
     main_frame,
@@ -285,10 +291,17 @@ def create_tunnel_view():
         detail_title.config(text="No tunnels configured")
 
 def update_gui():
-    if latest_windspeed is None:
-        windspeed_label.config(text="N/A")
-    else:
+    tower_online = (last_wind_received is not None and
+                    time.monotonic() - last_wind_received <= WIND_STALE_SECONDS)
+    if tower_online and latest_windspeed is not None:
         windspeed_label.config(text=f"{latest_windspeed:.2f} m/s")
+        wind_status_label.config(text="TOWER: online")
+    elif tower_online:
+        windspeed_label.config(text="N/A")
+        wind_status_label.config(text="TOWER: sensor error")
+    else:
+        windspeed_label.config(text="N/A")
+        wind_status_label.config(text="TOWER: offline / waiting")
 
     for tunnel in TUNNELS:
         device_id = tunnel["device_id"]
@@ -340,6 +353,10 @@ PAYLOAD_SIZE = 32
 RASPI_ADDRESS = "RASPI".encode("ascii")
 CHANNEL = 76
 TUNNELS = config["tunnels"]
+# Tower is a separate device, not a water tunnel and cannot drive a pump.
+TOWER_CONFIG = config.get("tower", {
+    "device_id": "TOWER", "role": "TOWER", "is_enabled": True
+})
 
 POLL_INTERVAL = 0.01
 STATUS_INTERVAL = 5.0
@@ -354,6 +371,7 @@ MSG_TELEMETRY = 3
 MSG_START_TRANSFER = 4
 MSG_TRANSFER_COMPLETE = 5
 MSG_SET_STATUS = 6
+MSG_WIND_TELEMETRY = 7
 
 
 
@@ -811,7 +829,11 @@ def handle_register_request(raw):
     print()
     print(f"REGISTER_REQUEST <- {device_id}")
 
-    if tunnel is None:
+    if device_id == TOWER_CONFIG["device_id"] and TOWER_CONFIG.get("role") == "TOWER":
+        status = STATUS_ENABLED if TOWER_CONFIG.get("is_enabled", True) else STATUS_DISABLED
+        status_name = "ENABLED" if status == STATUS_ENABLED else "DISABLED"
+
+    elif tunnel is None:
         status = STATUS_UNREGISTERED
         status_name = "UNREGISTERED"
 
@@ -837,11 +859,16 @@ def handle_register_request(raw):
 # START TRANSFER
 
 def request_start_transfer(device_id, min_level, message_id=None):
+    if mm_ke_adc is None:
+        print("SAFETY: Transfer blocked; add mm_ke_adc() to water_level_conversion.py")
+        return
+
     if message_id is None:
         message_id = get_next_message_id()
 
+    min_level_adc = mm_ke_adc(min_level)
+    packet = build_start_transfer(device_id, message_id, min_level_adc)
     process_map[device_id] = message_id
-    packet = build_start_transfer(device_id, message_id, min_level)
     print(f"build_start_transfer packet = {packet}")
 
     outgoing_queue.put({
@@ -850,7 +877,7 @@ def request_start_transfer(device_id, min_level, message_id=None):
         "description": (
             f"START_TRANSFER -> {device_id}, "
             f"message_id={message_id}, "
-            f"min_level={min_level}"
+            f"min_level={min_level} mm, min_level_adc={min_level_adc}"
         ),
         "send_at": time.monotonic() + TX_GUARD_DELAY
     })
@@ -882,7 +909,7 @@ def handle_telemetry(raw):
     air_temperature = None if air_temp_raw == -1 else air_temp_raw / 100.0
     humidity = None if humidity_raw == -1 else humidity_raw / 100.0
 
-    water_level = water_level_raw
+    water_level = adc_ke_mm(water_level_raw)
 
     salinity_result = (
         konversi_salinitas(salinity_raw, water_temperature)
@@ -948,7 +975,8 @@ def handle_telemetry(raw):
     # CHECK THRESHOLDS TO DETERMINE IF START_TRANSFER IS NEEDED
     tunnel = find_tunnel(device_id)
 
-    if tunnel is None or not tunnel["is_enabled"]:
+    if (tunnel is None or not tunnel["is_enabled"]
+            or tunnel.get("role") not in ("FRONT", "MIDDLE")):
         return
 
     thresholds = tunnel["thresholds"]
@@ -970,6 +998,42 @@ def handle_telemetry(raw):
 
         request_start_transfer(device_id, min_level)
 
+def handle_wind_telemetry(raw):
+    """Parse TOWER packet: <B5sIH (type, ID, sequence, raw ADC)."""
+    global latest_windspeed, last_wind_received
+
+    if len(raw) < 12:
+        print("WARNING: incomplete TOWER packet")
+        return
+
+    _, device_raw, sequence_id, adc_raw = struct.unpack("<B5sIH", raw[:12])
+    device_id = device_raw.decode("ascii", errors="replace").rstrip("\x00")
+
+    if (device_id != TOWER_CONFIG["device_id"]
+            or TOWER_CONFIG.get("role") != "TOWER"
+            or not TOWER_CONFIG.get("is_enabled", True)):
+        print(f"WARNING: unknown or disabled TOWER: {device_id}")
+        return
+
+    latest_windspeed = adc_ke_windspeed(adc_raw)
+    last_wind_received = time.monotonic()
+
+    stats = telemetry_stats.setdefault(device_id, {
+        "received": 0, "lost": 0, "duplicates": 0, "last_sequence": None
+    })
+    last = stats["last_sequence"]
+    if last is not None:
+        if sequence_id == last:
+            stats["duplicates"] += 1
+        elif sequence_id > last + 1:
+            stats["lost"] += sequence_id - last - 1
+    stats["received"] += 1
+    stats["last_sequence"] = sequence_id
+
+    speed_text = "N/A (check wiring/model)" if latest_windspeed is None else f"{latest_windspeed:.2f} m/s"
+    print(f"WIND <- {device_id} seq={sequence_id} adc={adc_raw} speed={speed_text}")
+
+
 def process_incoming_queue():
     try:
         raw = incoming_queue.get_nowait()
@@ -984,6 +1048,9 @@ def process_incoming_queue():
 
         elif message_type == MSG_TELEMETRY:
             handle_telemetry(raw)
+
+        elif message_type == MSG_WIND_TELEMETRY:
+            handle_wind_telemetry(raw)
 
         elif message_type == MSG_TRANSFER_COMPLETE:
             handle_transfer_complete(raw)
