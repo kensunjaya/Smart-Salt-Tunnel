@@ -52,7 +52,7 @@ def report_communication_stats():
             [t["device_id"] for t in TUNNELS] + [TOWER_CONFIG["device_id"]]
         ))
 
-        lines = [f"[{time.strftime('%H:%M:%S')}] COMMUNICATION STATS (since app start)"]
+        lines = [f"[{time.strftime('%H:%M:%S')}] COMMUNICATION STATS"]
         for device_id in devices:
             stats = telemetry_stats.get(device_id, {})
             rx = stats.get("received", 0)
@@ -76,7 +76,7 @@ def report_communication_stats():
             )
 
         lines.append(
-            "  ERRORS | " + " ".join(f"{key}={value}" for key, value in _error_counters.items())
+            "  ERROR | " + " ".join(f"{key}={value}" for key, value in _error_counters.items())
         )
         print("\n".join(lines) + "\n", flush=True)
     except Exception:
