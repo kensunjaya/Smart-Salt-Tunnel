@@ -9,7 +9,7 @@
         "water_level_target": 550.0,
         "min_level": 500.0,
         "min_baume": 0.5,
-        "baume_target": 1.0
+        "max_baume": 1.0
       }
     },
     {
@@ -21,7 +21,7 @@
         "water_level_target": 600,
         "min_level": 550,
         "min_baume": 1.0,
-        "baume_target": 1.5
+        "max_baume": 1.5
       }
     },
     {
@@ -33,7 +33,7 @@
         "water_level_target": 750,
         "min_level": 700,
         "min_baume": 25.0,
-        "baume_target": 30.0
+        "max_baume": 30.0
       }
     }
   ],

@@ -1,8 +1,5 @@
 import json
-import logging
-import sys
 import math
-import os
 import queue
 import re
 import struct
@@ -18,48 +15,94 @@ from wind_conversion import adc_ke_windspeed
 
 from pyrf24 import RF24, RF24_250KBPS, RF24_PA_LOW
 
-
-# LOGGING: INFO = events & telemetry, DEBUG = raw RF24 packets & threshold checks
-LOG_LEVEL = os.environ.get("SST_LOG_LEVEL", "DEBUG").upper()
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s.%(msecs)03d | %(levelname)-7s | %(threadName)s | %(message)s",
-    datefmt="%H:%M:%S",
-    stream=sys.stdout,
-    force=True,
-)
-log = logging.getLogger("SmartSaltTunnel")
-
-
-def fmt(value, digits=2):
-    return "N/A" if value is None else f"{value:.{digits}f}"
+# berapa detik sekali stats di-log di console
+COMM_STATS_INTERVAL_SECONDS = 30
+_comm_snapshots = {}
+_tx_counters = {}
+_tx_lock = threading.Lock()
+_error_counters = {"radio": 0, "rx": 0, "invalid": 0}
+_error_snapshot = {"radio": 0, "rx": 0, "invalid": 0}
 
 
 def update_telemetry_stats(device_id, sequence_id):
-    """Count sequence gaps as indications, not verified packet loss or physical TX."""
     stats = telemetry_stats.setdefault(device_id, {
         "received": 0, "lost": 0, "duplicates": 0,
         "last_sequence": None, "sequence_resets": 0,
+        "last_received_at": None,
     })
+    stats["last_received_at"] = time.monotonic()
     last = stats["last_sequence"]
+
     if last is not None:
         if sequence_id == last:
             stats["duplicates"] += 1
-            log.warning("[RADIO] %s duplicate seq=%d (total=%d)",
-                        device_id, sequence_id, stats["duplicates"])
             return False
-        if sequence_id > last + 1:
-            gap = sequence_id - last - 1
-            stats["lost"] += gap
-            log.warning("[RADIO] %s gap seq=%d..%d (%d sequence tidak terlihat; total=%d)",
-                        device_id, last + 1, sequence_id - 1, gap, stats["lost"])
-        elif sequence_id < last:
+        if sequence_id < last:
             stats["sequence_resets"] += 1
-            log.warning("[RADIO] %s sequence mundur %d -> %d (restart atau paket terlambat; cek node)",
-                        device_id, last, sequence_id)
+        elif sequence_id > last + 1:
+            stats["lost"] += sequence_id - last - 1
+
     stats["received"] += 1
     stats["last_sequence"] = sequence_id
     return True
+
+# untuk logging
+def report_communication_stats():
+    try:
+        now = time.monotonic()
+        devices = list(dict.fromkeys(
+            [t["device_id"] for t in TUNNELS] + [TOWER_CONFIG["device_id"]]
+        ))
+
+        lines = [f"[{time.strftime('%H:%M:%S')}] STATISTIK KOMUNIKASI (30 detik)"]
+        for device_id in devices:
+            stats = telemetry_stats.get(device_id, {})
+            before = _comm_snapshots.get(device_id, {})
+
+            def delta(key):
+                return max(0, stats.get(key, 0) - before.get(key, 0))
+
+            rx = delta("received")
+            gap = delta("lost")
+            dup = delta("duplicates")
+            reset = delta("sequence_resets")
+            pdr = f"{100 * rx / (rx + gap):.1f}%" if rx + gap else "N/A"
+
+            seen = stats.get("last_received_at")
+            age = f"{now - seen:.0f}s" if seen is not None else "belum ada"
+
+            with _tx_lock:
+                tx = _tx_counters.get(device_id, {}).copy()
+            tx_ack = max(0, tx.get("ack", 0) - before.get("tx_ack", 0))
+            tx_fail = max(0, tx.get("fail", 0) - before.get("tx_fail", 0))
+
+            lines.append(
+                f"  {device_id:<5} | RX={rx:<3} gap={gap:<3} dup={dup:<2} "
+                f"reset={reset:<2} PDR~={pdr:<6} | "
+                f"TX_ACK={tx_ack:<2} TX_FAIL={tx_fail:<2} | last={age}"
+            )
+
+            _comm_snapshots[device_id] = {
+                key: stats.get(key, 0)
+                for key in ("received", "lost", "duplicates", "sequence_resets")
+            }
+            _comm_snapshots[device_id].update(
+                tx_ack=tx.get("ack", 0), tx_fail=tx.get("fail", 0)
+            )
+
+        errors = {
+            key: _error_counters[key] - _error_snapshot[key]
+            for key in _error_counters
+        }
+        _error_snapshot.update(_error_counters)
+        lines.append(
+            "  ERRORS | " + " ".join(f"{key}={value}" for key, value in errors.items())
+        )
+        print("\n".join(lines) + "\n", flush=True)
+    except Exception:
+        _error_counters["rx"] += 1
+    finally:
+        root.after(COMM_STATS_INTERVAL_SECONDS * 1000, report_communication_stats)
 
 
 latest_telemetry = {}
@@ -68,7 +111,6 @@ selected_device_id = None
 ROLE_OPTIONS = ("FRONT", "MIDDLE", "BACK")
 latest_windspeed = None
 last_wind_received = None
-last_tower_state = None
 WIND_STALE_SECONDS = 35.0
 COLORS = {
     "background": "#eaf6ff",
@@ -217,10 +259,10 @@ def select_tunnel(device_id):
 
 def get_tunnel_detail_value(tunnel, key):
     thresholds = tunnel.get("thresholds", {})
-    if key == "baume_target":
+    if key == "min_baume":
         return (
             f'{thresholds.get("min_baume", 0):g} - '
-            f'{thresholds.get("baume_target", 0):g} °Bé'
+            f'{thresholds.get("max_baume", 0):g} Be'
         )
     if key == "water_level_target":
         return (
@@ -277,7 +319,7 @@ def create_tunnel_view():
     info_frame.pack(fill="x")
     info_widgets = {}
     for key, name in [
-        ("baume_target", "Salinity target (°Bé)"),
+        ("min_baume", "Salinity target (Be)"),
         ("water_level_target", "Water level target (mm)")
     ]:
         tk.Label(info_frame, text=name, font=("Arial", 12)).grid(
@@ -339,7 +381,6 @@ def create_tunnel_view():
         detail_title.config(text="No tunnels configured")
 
 def update_gui():
-    global last_tower_state
     tower_online = (last_wind_received is not None and
                     time.monotonic() - last_wind_received <= WIND_STALE_SECONDS)
     if tower_online and latest_windspeed is not None:
@@ -351,13 +392,6 @@ def update_gui():
     else:
         windspeed_label.config(text="N/A")
         wind_status_label.config(text="TOWER: offline / waiting")
-
-    tower_state = "online" if tower_online and latest_windspeed is not None else (
-        "sensor error" if tower_online else "offline / waiting"
-    )
-    if tower_state != last_tower_state:
-        log.info("[TOWER] status=%s", tower_state)
-        last_tower_state = tower_state
 
     for tunnel in TUNNELS:
         device_id = tunnel["device_id"]
@@ -400,8 +434,6 @@ def update_gui():
 
 
 # CONFIGURATION
-
-
 with open("config.json", "r", encoding="utf-8") as file:
     config = json.load(file)
 
@@ -416,26 +448,19 @@ TUNNELS = config["tunnels"]
 
 for tunnel in TUNNELS:
     thresholds = tunnel.get("thresholds", {})
-    if "baume_target" not in thresholds or "min_baume" not in thresholds:
+    if "max_baume" not in thresholds or "min_baume" not in thresholds:
         root.destroy()
         raise ValueError(
             f"Tunnel {tunnel.get('device_id', '?')}: config.json harus memiliki "
-            "thresholds.min_baume dan thresholds.baume_target (°Bé)."
+            "thresholds.min_baume dan thresholds.max_baume (°Bé)."
         )
 
-# Tower is a separate device, not a water tunnel and cannot drive a pump.
 TOWER_CONFIG = config.get("tower", {
-    "device_id": "TOWER", "role": "TOWER", "is_enabled": True
+    "device_id": "TOWER", 
+    "role": "TOWER", 
+    "is_enabled": True
 })
 
-log.info('[BOOT] Loaded %d tunnels, tower=%s enabled=%s',
-         len(TUNNELS), TOWER_CONFIG['device_id'], TOWER_CONFIG.get('is_enabled', True))
-for _t in TUNNELS:
-    log.info('[BOOT] %s role=%s enabled=%s target=%.3f °Bé | level_target=%.2f mm min=%.2f mm',
-             _t['device_id'], _t.get('role'), _t.get('is_enabled'),
-             float(_t['thresholds']['baume_target']),
-             float(_t['thresholds']['water_level_target']),
-             float(_t['thresholds']['min_level']))
 
 POLL_INTERVAL = 0.01
 STATUS_INTERVAL = 5.0
@@ -490,7 +515,6 @@ radio.setRetries(5, 15)
 radio.openReadingPipe(1, RASPI_ADDRESS)
 radio.flush_rx()
 radio.startListening()
-log.info('[RADIO] Initialized channel=%d rate=250kbps PA_LOW payload=%d', CHANNEL, PAYLOAD_SIZE)
 
 
 # CONFIG LOOKUP
@@ -568,7 +592,6 @@ def build_start_transfer(device_id, message_id, min_level):
 def save_config():
     with open("config.json", "w", encoding="utf-8") as file:
         json.dump(config, file, indent=2)
-    log.info("[CONFIG] config.json disimpan")
 
 def open_edit_tunnel_dialog(device_id):
     tunnel = find_tunnel(device_id)
@@ -604,9 +627,9 @@ def open_edit_tunnel_dialog(device_id):
     min_baume_entry = tk.Entry(form, width=10, font=("Arial", 11))
     min_baume_entry.insert(0, str(thresholds.get("min_baume", 0)))
     min_baume_entry.grid(row=1, column=1, sticky="w", pady=6)
-    baume_target_entry = tk.Entry(form, width=10, font=("Arial", 11))
-    baume_target_entry.insert(0, str(thresholds.get("baume_target", 0)))
-    baume_target_entry.grid(row=1, column=1, padx=(115, 0), pady=6)
+    max_baume_entry = tk.Entry(form, width=10, font=("Arial", 11))
+    max_baume_entry.insert(0, str(thresholds.get("max_baume", 0)))
+    max_baume_entry.grid(row=1, column=1, padx=(115, 0), pady=6)
     tk.Label(form, text="min                 max", font=("Arial", 8)).grid(
         row=2, column=1, sticky="w", padx=(2, 0)
     )
@@ -628,13 +651,13 @@ def open_edit_tunnel_dialog(device_id):
     def save_changes():
         role = role_combo.get().strip().upper()
         min_baume_text = min_baume_entry.get().strip()
-        baume_target_text = baume_target_entry.get().strip()
+        max_baume_text = max_baume_entry.get().strip()
         min_level_text = min_level_entry.get().strip()
         water_level_target_text = water_level_target_entry.get().strip()
 
         try:
             min_baume = float(min_baume_text)
-            baume_target = float(baume_target_text)
+            max_baume = float(max_baume_text)
             min_level = float(min_level_text)
             water_level_target = float(water_level_target_text)
         except ValueError:
@@ -645,10 +668,10 @@ def open_edit_tunnel_dialog(device_id):
             )
             return
         if (
-            not all(math.isfinite(v) for v in (min_baume, baume_target, min_level, water_level_target))
-            or min_baume < 0 or baume_target < 0
+            not all(math.isfinite(v) for v in (min_baume, max_baume, min_level, water_level_target))
+            or min_baume < 0 or max_baume < 0
             or min_level < 0 or water_level_target < 0
-            or min_baume > baume_target
+            or min_baume > max_baume
             or min_level > water_level_target
         ):
             messagebox.showerror(
@@ -660,12 +683,10 @@ def open_edit_tunnel_dialog(device_id):
 
         tunnel["role"] = role
         thresholds["min_baume"] = min_baume
-        thresholds["baume_target"] = baume_target
+        thresholds["max_baume"] = max_baume
         thresholds["min_level"] = min_level
         thresholds["water_level_target"] = water_level_target
         save_config()
-        log.info('[CONFIG] %s role=%s | °Bé min=%s target=%s | level min=%s target=%s mm',
-                 device_id, role, min_baume, baume_target, min_level, water_level_target)
         create_tunnel_view()
         dialog.destroy()
 
@@ -718,8 +739,8 @@ def open_add_tunnel_dialog():
     )
     min_baume_entry = tk.Entry(form, width=10, font=("Arial", 11))
     min_baume_entry.grid(row=2, column=1, sticky="w", pady=6)
-    baume_target_entry = tk.Entry(form, width=10, font=("Arial", 11))
-    baume_target_entry.grid(row=2, column=1, padx=(115, 0), pady=6)
+    max_baume_entry = tk.Entry(form, width=10, font=("Arial", 11))
+    max_baume_entry.grid(row=2, column=1, padx=(115, 0), pady=6)
     tk.Label(form, text="min                 max", font=("Arial", 8)).grid(
         row=3, column=1, sticky="w", padx=(2, 0)
     )
@@ -740,7 +761,7 @@ def open_add_tunnel_dialog():
         role = entries["role"].get().strip().upper()
         values = (
             min_baume_entry.get().strip(),
-            baume_target_entry.get().strip(),
+            max_baume_entry.get().strip(),
             min_level_entry.get().strip(),
             water_level_target_entry.get().strip()
         )
@@ -760,7 +781,7 @@ def open_add_tunnel_dialog():
             )
             return
         try:
-            min_baume, baume_target, min_level, water_level_target = (
+            min_baume, max_baume, min_level, water_level_target = (
                 float(value) for value in values
             )
         except ValueError:
@@ -770,11 +791,10 @@ def open_add_tunnel_dialog():
                 parent=dialog
             )
             return
-        if (
-            not all(math.isfinite(v) for v in (min_baume, baume_target, min_level, water_level_target))
-            or min_baume < 0 or baume_target < 0
+        if (not all(math.isfinite(v) for v in (min_baume, max_baume, min_level, water_level_target))
+            or min_baume < 0 or max_baume < 0
             or min_level < 0 or water_level_target < 0
-            or min_baume > baume_target
+            or min_baume > max_baume
             or min_level > water_level_target
         ):
             messagebox.showerror(
@@ -792,13 +812,11 @@ def open_add_tunnel_dialog():
             "thresholds": {
                 "water_level_target": water_level_target,
                 "min_level": min_level,
-                "baume_target": baume_target,
+                "max_baume": max_baume,
                 "min_baume": min_baume
             }
         })
         save_config()
-        log.info('[CONFIG] Tunnel baru %s role=%s | °Bé min=%s target=%s | level min=%s target=%s mm',
-                 device_id, role, min_baume, baume_target, min_level, water_level_target)
         create_tunnel_view()
         dialog.destroy()
 
@@ -821,7 +839,6 @@ def toggle_tunnel_status(device_id):
 def set_tunnel_status(device_id, enabled):
     tunnel = find_tunnel(device_id)
     if tunnel is None:
-        log.warning("[CONFIG] Device %s tidak ditemukan", device_id)
         return
 
     status = STATUS_ENABLED if enabled else STATUS_DISABLED
@@ -830,7 +847,6 @@ def set_tunnel_status(device_id, enabled):
     save_config()
 
     if not enabled and device_id in process_map:
-        log.warning("[CONTROL] %s dinonaktifkan saat transfer tercatat aktif; menunggu SET_STATUS diterima Arduino", device_id)
         process_map.pop(device_id, None)
 
     outgoing_queue.put({
@@ -839,27 +855,21 @@ def set_tunnel_status(device_id, enabled):
         "description": f"SET_STATUS -> {device_id}, status={status_name}",
         "send_at": time.monotonic() + TX_GUARD_DELAY,
     })
-    log.info("[CONFIG] %s %s | SET_STATUS masuk outgoing_queue", device_id, status_name)
 
 
 
 # RADIO THREAD
 
 def radio_worker():
-    log.info("[RADIO] Radio Thread started | channel=%d rate=250kbps payload=%d", CHANNEL, PAYLOAD_SIZE)
     pending_outgoing = None
     while not stop_event.is_set():
         try:
-            # RECEIVE: store packet for Tkinter main thread, no UI updates here.
             if radio.available():
                 raw = bytes(radio.read(PAYLOAD_SIZE))
                 if any(raw):
                     incoming_queue.put(raw)
-                    log.debug("[RADIO RX] type=%d device=%s raw=%s | queue=%d",
-                              raw[0], raw[1:6].decode('ascii', errors='replace').rstrip('\x00'),
-                              raw.hex(' '), incoming_queue.qsize())
                 else:
-                    log.warning("[RADIO RX] Paket kosong diterima")
+                    _error_counters["invalid"] += 1
 
             if pending_outgoing is None:
                 try:
@@ -867,61 +877,61 @@ def radio_worker():
                 except queue.Empty:
                     pass
 
-            if pending_outgoing and time.monotonic() >= pending_outgoing['send_at']:
+            if pending_outgoing and time.monotonic() >= pending_outgoing["send_at"]:
                 outgoing = pending_outgoing
-                destination = outgoing['destination']
-                packet = outgoing['packet']
+                destination = outgoing["destination"]
                 success = False
                 try:
-                    # RF24: choose TX address, switch from PRX to PTX, transmit, return to listening.
-                    radio.openWritingPipe(destination.encode('ascii'))
+                    radio.openWritingPipe(destination.encode("ascii"))
                     radio.stopListening()
-                    log.debug("[RADIO TX] to=%s raw=%s", destination, packet.hex(' '))
-                    success = radio.write(packet)
+                    success = bool(radio.write(outgoing["packet"]))
+                except Exception:
+                    _error_counters["radio"] += 1
                 finally:
-                    radio.startListening()
+                    try:
+                        radio.startListening()
+                    except Exception:
+                        _error_counters["radio"] += 1
                     outgoing_queue.task_done()
                     pending_outgoing = None
-                if success:
-                    log.info("[RADIO TX] %s | RF24 ACK", outgoing['description'])
-                else:
-                    log.warning("[RADIO TX] %s | ACK tidak diterima", outgoing['description'])
+
+                with _tx_lock:
+                    counters = _tx_counters.setdefault(destination, {"ack": 0, "fail": 0})
+                    counters["ack" if success else "fail"] += 1
 
         except Exception:
-            log.exception("[RADIO] Gagal memproses paket; radio thread tetap berjalan")
+            _error_counters["radio"] += 1
             time.sleep(0.1)
         time.sleep(POLL_INTERVAL)
+
     try:
         radio.stopListening()
     except Exception:
-        log.exception("[RADIO] Error ketika menghentikan radio")
-    log.info("[RADIO] Radio Thread stopped")
+        _error_counters["radio"] += 1
 
 
 
 # REGISTER REQUEST
 
 def handle_register_request(raw):
-    _, device_raw = struct.unpack('<B5s', raw[:6])
-    device_id = device_raw.decode('ascii').rstrip('\x00')
+    _, device_raw = struct.unpack("<B5s", raw[:6])
+    device_id = device_raw.decode("ascii").rstrip("\x00")
     tunnel = find_tunnel(device_id)
 
-    if device_id == TOWER_CONFIG['device_id'] and TOWER_CONFIG.get('role') == 'TOWER':
-        status = STATUS_ENABLED if TOWER_CONFIG.get('is_enabled', True) else STATUS_DISABLED
+    if device_id == TOWER_CONFIG["device_id"] and TOWER_CONFIG.get("role") == "TOWER":
+        status = STATUS_ENABLED if TOWER_CONFIG.get("is_enabled", True) else STATUS_DISABLED
     elif tunnel is None:
         status = STATUS_UNREGISTERED
-    elif not tunnel['is_enabled']:
+    elif not tunnel["is_enabled"]:
         status = STATUS_DISABLED
     else:
         status = STATUS_ENABLED
 
-    status_name = {0: 'UNREGISTERED', 1: 'DISABLED', 2: 'ENABLED'}.get(status, 'UNKNOWN')
-    log.info('[REGISTER] request=%s | response=%s', device_id, status_name)
     outgoing_queue.put({
-        'destination': device_id,
-        'packet': build_register_ack(device_id, status),
-        'description': f'REGISTER_ACK -> {device_id}, status={status_name}',
-        'send_at': time.monotonic() + TX_GUARD_DELAY,
+        "destination": device_id,
+        "packet": build_register_ack(device_id, status),
+        "description": f"REGISTER_ACK -> {device_id}",
+        "send_at": time.monotonic() + TX_GUARD_DELAY,
     })
 
 
@@ -929,11 +939,6 @@ def handle_register_request(raw):
 # START TRANSFER
 
 def request_start_transfer(device_id, min_level, message_id=None):
-    if mm_ke_adc is None:
-        log.error('[SAFETY] %s START_TRANSFER diblokir: mm_ke_adc tidak tersedia', device_id)
-        return
-
-    retry = message_id is not None
     if message_id is None:
         message_id = get_next_message_id()
 
@@ -941,32 +946,22 @@ def request_start_transfer(device_id, min_level, message_id=None):
     packet = build_start_transfer(device_id, message_id, min_level_adc)
     process_map[device_id] = message_id
     outgoing_queue.put({
-        'destination': device_id,
-        'packet': packet,
-        'description': (
-            f'START_TRANSFER -> {device_id}, message_id={message_id}, '
-            f'min_level={min_level} mm, min_level_adc={min_level_adc}'
-        ),
-        'send_at': time.monotonic() + TX_GUARD_DELAY,
+        "destination": device_id,
+        "packet": packet,
+        "description": f"START_TRANSFER -> {device_id}, id={message_id}",
+        "send_at": time.monotonic() + TX_GUARD_DELAY,
     })
-    # A retry is not evidence of a new pump start.
-    if retry:
-        log.warning('[CONTROL] %s START_TRANSFER dikirim ulang | id=%d, min=%s mm (ADC=%d)',
-                    device_id, message_id, min_level, min_level_adc)
-    else:
-        log.info('[CONTROL] %s START_TRANSFER antre | id=%d, min=%s mm (ADC=%d)',
-                 device_id, message_id, min_level, min_level_adc)
 
 
 
 # TELEMETRY
 def handle_telemetry(raw):
-    (
-        _, device_raw, sequence_id, water_temp_raw, air_temp_raw,
-        humidity_raw, water_level_raw, salinity_raw, ph_raw,
-    ) = struct.unpack('<B5sIhhhHHh', raw[:22])
+    (_, device_raw, sequence_id, water_temp_raw, air_temp_raw, humidity_raw, water_level_raw, salinity_raw, ph_raw) = struct.unpack("<B5sIhhhHHh", raw[:22])
+    device_id = device_raw.decode("ascii").rstrip("\x00")
 
-    device_id = device_raw.decode('ascii').rstrip('\x00')
+    if not update_telemetry_stats(device_id, sequence_id):
+        return
+
     water_temperature = None if water_temp_raw == -1 else water_temp_raw / 100.0
     air_temperature = None if air_temp_raw == -1 else air_temp_raw / 100.0
     humidity = None if humidity_raw == -1 else humidity_raw / 100.0
@@ -975,106 +970,67 @@ def handle_telemetry(raw):
         konversi_salinitas(salinity_raw, water_temperature)
         if water_temperature is not None else None
     )
-    baume = salinity_result['baume'] if salinity_result else None
+    baume = salinity_result.get("baume") if salinity_result else None
     if baume is not None and not math.isfinite(baume):
         baume = None
     ph = adc_ke_ph(ph_raw) if ph_raw != -1 else None
 
-    # One line per telemetry: hardware ADC, converted values, and timing/seq.
-    log.info(
-        '[TELEMETRY] %s seq=%d | ADC(sal=%d,level=%d,pH=%d) | '
-        'sal=%s °Bé | level=%s mm | pH=%s | water=%s°C air=%s°C RH=%s%%',
-        device_id, sequence_id, salinity_raw, water_level_raw, ph_raw,
-        fmt(baume), fmt(water_level), fmt(ph),
-        fmt(water_temperature), fmt(air_temperature), fmt(humidity),
-    )
-    if salinity_result:
-        log.debug('[CONVERSION] %s salinity ADC=%d -> ppt=%s, SG=%s, Bé=%s',
-                  device_id, salinity_raw,
-                  fmt(salinity_result.get('ppt'), 3),
-                  fmt(salinity_result.get('sg'), 5), fmt(baume, 3))
-    if baume is None:
-        log.warning('[SENSOR] %s konversi °Bé tidak valid (ADC=%d, air=%s°C)',
-                    device_id, salinity_raw, fmt(water_temperature))
-
-    if not update_telemetry_stats(device_id, sequence_id):
-        return
-
     latest_telemetry[device_id] = {
-        'water_temperature': water_temperature,
-        'air_temperature': air_temperature,
-        'humidity': humidity,
-        'water_level': water_level,
-        'baume': baume,
-        'ph': ph,
+        "water_temperature": water_temperature,
+        "air_temperature": air_temperature,
+        "humidity": humidity,
+        "water_level": water_level,
+        "baume": baume,
+        "ph": ph,
     }
 
     tunnel = find_tunnel(device_id)
-    if tunnel is None:
-        log.warning('[TELEMETRY] Device tak dikenal %s (tidak dipakai untuk kontrol)', device_id)
+    if tunnel is None or not tunnel["is_enabled"]:
         return
-    if not tunnel['is_enabled']:
-        log.debug('[CONTROL] %s DISABLED -> skip threshold', device_id)
-        return
-    if tunnel.get('role') not in ('FRONT', 'MIDDLE'):
-        log.debug('[CONTROL] %s role=%s -> tidak memiliki pompa transfer', device_id, tunnel.get('role'))
+    if tunnel.get("role") not in ("FRONT", "MIDDLE"):
         return
 
-    thresholds = tunnel['thresholds']
-    target_baume = thresholds['min_baume']
-    target_level = thresholds['water_level_target']
-    min_level = thresholds['min_level']
+    thresholds = tunnel["thresholds"]
+    target_baume = thresholds["min_baume"]
+    target_level = thresholds["water_level_target"]
+    min_level = thresholds["min_level"]
 
     if device_id in process_map:
-        log.debug('[CONTROL] %s transfer masih tercatat aktif (id=%d)',
-                  device_id, process_map[device_id])
         request_start_transfer(device_id, min_level, process_map[device_id])
         return
 
     met_baume = baume is not None and math.isfinite(baume) and baume >= target_baume
     met_level = water_level is not None and math.isfinite(water_level) and water_level >= target_level
-    log.debug('[THRESHOLD] %s °Bé=%s/%s [%s] level=%s/%s mm [%s]',
-              device_id, fmt(baume), target_baume, 'OK' if met_baume else 'NO',
-              fmt(water_level), target_level, 'OK' if met_level else 'NO')
 
     if met_baume and met_level:
-        log.info('[THRESHOLD] %s TERPENUHI: %.2f >= %.2f °Bé; %.2f >= %.2f mm',
-                 device_id, baume, target_baume, water_level, target_level)
         request_start_transfer(device_id, min_level)
-    elif baume is None or water_level is None:
-        log.warning('[CONTROL] %s transfer tidak dipicu: data sensor tidak valid', device_id)
 
 def handle_wind_telemetry(raw):
-    """Parse TOWER packet: <B5sIH (type, ID, sequence, raw ADC)."""
     global latest_windspeed, last_wind_received
     if len(raw) < 12:
-        log.warning('[TOWER] Paket WIND tidak lengkap (%d bytes)', len(raw))
-        return
-    _, device_raw, sequence_id, adc_raw = struct.unpack('<B5sIH', raw[:12])
-    device_id = device_raw.decode('ascii', errors='replace').rstrip('\x00')
-    if (device_id != TOWER_CONFIG['device_id']
-            or TOWER_CONFIG.get('role') != 'TOWER'
-            or not TOWER_CONFIG.get('is_enabled', True)):
-        log.warning('[TOWER] Telemetry dari device tidak dikenal/nonaktif: %s', device_id)
+        _error_counters["invalid"] += 1
         return
 
-    speed = adc_ke_windspeed(adc_raw)
-    log.info('[WIND] %s seq=%d | ADC=%d -> %s m/s',
-             device_id, sequence_id, adc_raw, fmt(speed))
-    if speed is None:
-        log.warning('[SENSOR] %s anemometer ADC=%d tidak valid', device_id, adc_raw)
+    _, device_raw, sequence_id, adc_raw = struct.unpack("<B5sIH", raw[:12])
+    device_id = device_raw.decode("ascii", errors="replace").rstrip("\x00")
+    if (device_id != TOWER_CONFIG["device_id"]
+            or TOWER_CONFIG.get("role") != "TOWER"
+            or not TOWER_CONFIG.get("is_enabled", True)):
+        _error_counters["invalid"] += 1
+        return
+
     if not update_telemetry_stats(device_id, sequence_id):
         return
-    latest_windspeed = speed
+    latest_windspeed = adc_ke_windspeed(adc_raw)
     last_wind_received = time.monotonic()
 
 
 def process_incoming_queue():
-    # Always schedule next callback, even when one packet cannot be parsed.
     try:
         raw = incoming_queue.get_nowait()
     except queue.Empty:
         raw = None
+
     try:
         if raw:
             message_type = raw[0]
@@ -1087,9 +1043,9 @@ def process_incoming_queue():
             elif message_type == MSG_TRANSFER_COMPLETE:
                 handle_transfer_complete(raw)
             else:
-                log.warning('[RADIO RX] Unknown message type=%d, raw=%s', message_type, raw.hex(' '))
+                _error_counters["invalid"] += 1
     except Exception:
-        log.exception('[ERROR] Gagal memproses paket incoming; lanjut ke paket berikutnya')
+        _error_counters["rx"] += 1
     finally:
         if raw is not None:
             incoming_queue.task_done()
@@ -1100,20 +1056,13 @@ def process_incoming_queue():
 # TRANSFER COMPLETE
 
 def handle_transfer_complete(raw):
-    _, device_raw, message_id = struct.unpack('<B5sI', raw[:10])
-    device_id = device_raw.decode('ascii').rstrip('\x00')
+    _, device_raw, message_id = struct.unpack("<B5sI", raw[:10])
+    device_id = device_raw.decode("ascii").rstrip("\x00")
     expected_message_id = process_map.get(device_id)
-    if expected_message_id is None:
-        log.warning('[TRANSFER] COMPLETE dari %s id=%d, tetapi tidak ada transfer aktif',
-                    device_id, message_id)
-        return
-    if message_id != expected_message_id:
-        log.warning('[TRANSFER] COMPLETE %s id=%d tidak cocok (expected=%d)',
-                    device_id, message_id, expected_message_id)
+    if expected_message_id is None or message_id != expected_message_id:
+        _error_counters["invalid"] += 1
         return
     del process_map[device_id]
-    log.info('[TRANSFER] COMPLETE %s id=%d | status lokal menjadi IDLE',
-             device_id, message_id)
 
 
 
@@ -1130,12 +1079,10 @@ radio_thread.start()
 
 # GUI CLOSE HANDLER
 def on_close():
-    log.info('[GUI] Shutdown diminta')
     stop_event.set()
     if radio_thread.is_alive():
         radio_thread.join()
     root.destroy()
-    log.info('[GUI] Shutdown selesai')
 
 
 
@@ -1145,6 +1092,7 @@ create_tunnel_view()
 
 process_incoming_queue()
 update_gui()
+root.after(COMM_STATS_INTERVAL_SECONDS * 1000, report_communication_stats)
 
 root.protocol("WM_DELETE_WINDOW", on_close)
 
