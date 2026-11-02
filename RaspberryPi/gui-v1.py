@@ -17,11 +17,9 @@ from pyrf24 import RF24, RF24_250KBPS, RF24_PA_LOW
 
 # berapa detik sekali stats di-log di console
 COMM_STATS_INTERVAL_SECONDS = 30
-_comm_snapshots = {}
 _tx_counters = {}
 _tx_lock = threading.Lock()
 _error_counters = {"radio": 0, "rx": 0, "invalid": 0}
-_error_snapshot = {"radio": 0, "rx": 0, "invalid": 0}
 
 
 def update_telemetry_stats(device_id, sequence_id):
@@ -54,27 +52,22 @@ def report_communication_stats():
             [t["device_id"] for t in TUNNELS] + [TOWER_CONFIG["device_id"]]
         ))
 
-        lines = [f"[{time.strftime('%H:%M:%S')}] STATISTIK KOMUNIKASI (30 detik)"]
+        lines = [f"[{time.strftime('%H:%M:%S')}] COMMUNICATION STATS (since app start)"]
         for device_id in devices:
             stats = telemetry_stats.get(device_id, {})
-            before = _comm_snapshots.get(device_id, {})
-
-            def delta(key):
-                return max(0, stats.get(key, 0) - before.get(key, 0))
-
-            rx = delta("received")
-            gap = delta("lost")
-            dup = delta("duplicates")
-            reset = delta("sequence_resets")
+            rx = stats.get("received", 0)
+            gap = stats.get("lost", 0)
+            dup = stats.get("duplicates", 0)
+            reset = stats.get("sequence_resets", 0)
             pdr = f"{100 * rx / (rx + gap):.1f}%" if rx + gap else "N/A"
 
             seen = stats.get("last_received_at")
-            age = f"{now - seen:.0f}s" if seen is not None else "belum ada"
+            age = f"{now - seen:.0f}s" if seen is not None else "N/A"
 
             with _tx_lock:
                 tx = _tx_counters.get(device_id, {}).copy()
-            tx_ack = max(0, tx.get("ack", 0) - before.get("tx_ack", 0))
-            tx_fail = max(0, tx.get("fail", 0) - before.get("tx_fail", 0))
+            tx_ack = tx.get("ack", 0)
+            tx_fail = tx.get("fail", 0)
 
             lines.append(
                 f"  {device_id:<5} | RX={rx:<3} gap={gap:<3} dup={dup:<2} "
@@ -82,21 +75,8 @@ def report_communication_stats():
                 f"TX_ACK={tx_ack:<2} TX_FAIL={tx_fail:<2} | last={age}"
             )
 
-            _comm_snapshots[device_id] = {
-                key: stats.get(key, 0)
-                for key in ("received", "lost", "duplicates", "sequence_resets")
-            }
-            _comm_snapshots[device_id].update(
-                tx_ack=tx.get("ack", 0), tx_fail=tx.get("fail", 0)
-            )
-
-        errors = {
-            key: _error_counters[key] - _error_snapshot[key]
-            for key in _error_counters
-        }
-        _error_snapshot.update(_error_counters)
         lines.append(
-            "  ERRORS | " + " ".join(f"{key}={value}" for key, value in errors.items())
+            "  ERRORS | " + " ".join(f"{key}={value}" for key, value in _error_counters.items())
         )
         print("\n".join(lines) + "\n", flush=True)
     except Exception:
@@ -117,6 +97,9 @@ COLORS = {
     "panel": "#d9efff",
     "accent": "#9ed8f5",
     "accent_active": "#78c5eb",
+    "disabled": "#c7c7c7",
+    "disabled_active": "#b0b0b0",
+    "warning": "#c62828",
     "text": "#16324f",
     "white": "#ffffff"
 }
@@ -303,8 +286,11 @@ def create_tunnel_view():
             text=f'{device_id}\n{tunnel.get("role", "-")}',
             font=("Arial", 12),
             width=13,
+            bg=COLORS["accent"] if tunnel["is_enabled"] else COLORS["disabled"],
+            activebackground=COLORS["accent_active"] if tunnel["is_enabled"] else COLORS["disabled_active"],
             command=lambda d=device_id: select_tunnel(d)
         )
+        tunnel_widgets[device_id] = button
         button.pack(fill="x", pady=3)
         button.bind("<MouseWheel>", scroll_tunnel_list)
         button.bind("<Button-4>", scroll_tunnel_list)
@@ -395,6 +381,10 @@ def update_gui():
 
     for tunnel in TUNNELS:
         device_id = tunnel["device_id"]
+        tunnel_widgets[device_id].config(
+            bg=COLORS["accent"] if tunnel["is_enabled"] else COLORS["disabled"],
+            activebackground=COLORS["accent_active"] if tunnel["is_enabled"] else COLORS["disabled_active"],
+        )
         if device_id != selected_device_id or not detail_widgets:
             continue
 
@@ -402,7 +392,7 @@ def update_gui():
         telemetry = latest_telemetry.get(device_id)
         if telemetry is None:
             for label in detail_widgets["sensors"].values():
-                label.config(text="-")
+                label.config(text="-", fg=COLORS["text"])
         else:
             water_temperature = telemetry["water_temperature"]
             air_temperature = telemetry["air_temperature"]
@@ -412,8 +402,14 @@ def update_gui():
                 text="N/A" if telemetry["water_level"] is None
                 else f'{telemetry["water_level"]:.2f} mm'
             )
+            baume = telemetry["baume"]
+            above_max = baume is not None and baume > tunnel["thresholds"]["max_baume"]
+            baume_text = "N/A" if baume is None else f"{baume:.2f} °Bé"
+            if above_max:
+                baume_text += " (Melebihi batas)"
             detail_widgets["sensors"]["baume"].config(
-                text="N/A" if telemetry["baume"] is None else f'{telemetry["baume"]:.2f} °Bé'
+                text=baume_text,
+                fg=COLORS["warning"] if above_max else COLORS["text"],
             )
             detail_widgets["sensors"]["water_temperature"].config(
                 text="N/A" if water_temperature is None else f"{water_temperature:.2f} °C"
