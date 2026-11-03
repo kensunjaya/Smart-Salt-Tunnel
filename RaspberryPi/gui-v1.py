@@ -6,6 +6,7 @@ import struct
 import threading
 import time
 import tkinter as tk
+from pathlib import Path
 from tkinter import messagebox, ttk
 
 from salinity_conversion import konversi_salinitas
@@ -15,8 +16,10 @@ from wind_conversion import adc_ke_windspeed
 
 from pyrf24 import RF24, RF24_250KBPS, RF24_PA_LOW
 
-# berapa detik sekali stats di-log di console
+# berapa detik sekali stats di-logging
 COMM_STATS_INTERVAL_SECONDS = 30
+LOG_DIR = Path(__file__).resolve().parent / "logs"
+LOG_FILE = LOG_DIR / f"communication-{time.strftime('%Y-%m-%d_%H-%M-%S')}.log"
 _tx_counters = {}
 _tx_lock = threading.Lock()
 _error_counters = {"radio": 0, "rx": 0, "invalid": 0}
@@ -48,9 +51,7 @@ def update_telemetry_stats(device_id, sequence_id):
 def report_communication_stats():
     try:
         now = time.monotonic()
-        devices = list(dict.fromkeys(
-            [t["device_id"] for t in TUNNELS] + [TOWER_CONFIG["device_id"]]
-        ))
+        devices = list(dict.fromkeys([t["device_id"] for t in TUNNELS] + [TOWER_CONFIG["device_id"]]))
 
         lines = [f"[{time.strftime('%H:%M:%S')}] COMMUNICATION STATS"]
         for device_id in devices:
@@ -75,10 +76,16 @@ def report_communication_stats():
                 f"TX_ACK={tx_ack:<2} TX_FAIL={tx_fail:<2} | last={age}"
             )
 
-        lines.append(
-            "  ERROR | " + " ".join(f"{key}={value}" for key, value in _error_counters.items())
-        )
-        print("\n".join(lines) + "\n", flush=True)
+
+        lines.append("  ERROR | " + " ".join(f"{key}={value}" for key, value in _error_counters.items()))
+        report = "\n".join(lines) + "\n\n"
+        print(report, end="", flush=True)
+        try:
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            with LOG_FILE.open("a", encoding="utf-8") as log_file:
+                log_file.write(report)
+        except OSError as error:
+            print(f"Unable to write communication log: {error}", flush=True)
     except Exception:
         _error_counters["rx"] += 1
     finally:
@@ -144,9 +151,7 @@ add_tunnel_button = tk.Button(
 )
 add_tunnel_button.pack(fill="x", pady=(0, 10))
 
-tunnel_list_canvas = tk.Canvas(
-    sidebar, highlightthickness=0, bg=COLORS["panel"]
-)
+tunnel_list_canvas = tk.Canvas(sidebar, highlightthickness=0, bg=COLORS["panel"])
 tunnel_list_scrollbar = ttk.Scrollbar(
     sidebar,
     orient="vertical",
@@ -154,9 +159,7 @@ tunnel_list_scrollbar = ttk.Scrollbar(
     style="Blue.Vertical.TScrollbar"
 )
 tunnel_list_frame = tk.Frame(tunnel_list_canvas, bg=COLORS["panel"])
-tunnel_list_window = tunnel_list_canvas.create_window(
-    (0, 0), window=tunnel_list_frame, anchor="nw"
-)
+tunnel_list_window = tunnel_list_canvas.create_window((0, 0), window=tunnel_list_frame, anchor="nw")
 tunnel_list_canvas.configure(yscrollcommand=tunnel_list_scrollbar.set)
 tunnel_list_canvas.pack(side="left", fill="both", expand=True)
 tunnel_list_scrollbar.pack(side="right", fill="y")
